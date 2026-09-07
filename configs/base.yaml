@@ -1,0 +1,21 @@
+# Shared defaults used across stages and experiments.
+# Hardware-, dataset-, and model-specific values should live in stage/model configs
+# or be overridden from the notebook.
+
+seed:
+  value: 42
+  deterministic: true
+  strict: true
+
+paths:
+  output_dir: outputs
+  submission_dir: submissions
+
+logging:
+  level: INFO
+  save_file: true
+
+  wandb:
+    enabled: true
+    project: blackbox-detection
+    entity: null
