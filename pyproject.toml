@@ -1,16 +1,61 @@
 [project]
 name = "blackbox-detection"
 version = "0.1.0"
-requires-python = ">=3.10"
+description = "DACON blackbox intentional accident detection"
+requires-python = ">=3.10,<3.13"
 
+# Development / training environment.
+#
+# Packages already provided by the DACON evaluation server are pinned to the
+# server versions wherever practical. The submission requirements.txt should
+# be generated separately and contain only packages that are NOT preinstalled
+# on the evaluation server.
+#
+# PyTorch CUDA wheels are environment-specific. Keep torch/torchvision versions
+# here; in Colab, install the matching CUDA wheel separately only when the
+# runtime's preinstalled PyTorch does not match this project.
 dependencies = [
-    "torch",
-    "torchvision",
-    "opencv-python",
-    "numpy",
-    "pandas",
-    "scikit-learn",
-    "tqdm",
+    # PyTorch
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+
+    # Core scientific stack
+    "numpy==1.26.4",
+    "pandas==2.2.2",
+    "scipy==1.15.3",
+    "scikit-learn==1.5.2",
+
+    # Image / video
+    "opencv-python-headless==4.10.0.84",
+    "pillow==10.4.0",
+    "av>=15,<17",
+    "imageio==2.37.0",
+    "imageio-ffmpeg==0.6.0",
+    "albumentations==1.4.20",
+
+    # Video / vision model stack
+    "timm==1.0.15",
+    "fvcore==0.1.5.post20221221",
+    "iopath==0.1.10",
+    "yacs==0.1.8",
+    "einops==0.8.1",
+
+    # Hugging Face / foundation-model stack
+    "transformers==4.57.6",
+    "accelerate==1.9.0",
+    "huggingface-hub==0.34.4",
+    "safetensors==0.6.2",
+    "sentencepiece==0.2.0",
+    "tokenizers>=0.22,<0.24",
+
+    # Configuration / training utilities
+    "omegaconf==2.3.0",
+    "hydra-core==1.3.2",
+    "PyYAML==6.0.2",
+    "tqdm==4.66.5",
+
+    # Experiment tracking (development only; do not import in submission inference)
+    "wandb==0.29.0",
 ]
 
 [build-system]
