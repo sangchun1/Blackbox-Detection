@@ -7,7 +7,6 @@
 #
 # Patches are cropped from native-resolution frames. Never resize a frame
 # before cropping: that destroys the moire/aliasing/sub-pixel traces.
-
 defaults:
   data:
     patch_size: 256
@@ -19,7 +18,6 @@ defaults:
     batch_size: 8               # videos per batch; patches per step = batch * frames * patches
     val_batch_size: 4
     num_workers: 4
-
   augmentation:
     hflip_prob: 0.5
     vflip_prob: 0.0
@@ -31,7 +29,6 @@ defaults:
     spectral_augment_alpha_range: [0.5, 0.8]
     spectral_augment_beta_std: 1.0
     spectral_augment_keep_outside: false
-
   train:
     epochs: 15
     learning_rate: 1.0e-4
@@ -45,7 +42,6 @@ defaults:
     early_stopping_patience: 5
     eval_every: 1
     seed: 42
-
   evaluation:
     # patch -> frame -> video. Mean probability is the initial choice; a learned
     # aggregator can be registered in evaluator.AGGREGATORS later.
@@ -53,7 +49,6 @@ defaults:
       frame_method: mean
       video_method: mean
     search_threshold: true
-
 # Per-model overrides, merged onto `defaults`.
 models:
   bayar_resnet18:
@@ -69,19 +64,17 @@ models:
         pretrained: true
         dropout: 0.1
         patch_size: 256
-
   chromaticity:
     model:
       name: chromaticity
       finetune_mode: last_n
       unfreeze_last_n: 2
       params:
-        normalize: lcdf            # zscore (CMA) | lcdf | none
+        normalize: zscore          # zscore (CMA) | lcdf | none
         encoder: resnet18
         pretrained: true
         dropout: 0.1
         patch_size: 256
-
   frequency:
     model:
       name: frequency
@@ -97,7 +90,6 @@ models:
         patch_size: 256
     augmentation:
       spectral_augment_prob: 0.3
-
   lcdf:
     model:
       name: lcdf
@@ -113,7 +105,6 @@ models:
         dropout: 0.1
         patch_size: 256
         learnable_alpha: true
-
   cdc:
     model:
       name: cdc

@@ -6,7 +6,6 @@ P. Li, C. Chen, Y. Chernyshova, D. Nikolaev, S. Tan and V. Arlazarov,
 "Disentangling Moire and Texture: Towards Robust Display-Recapture Detection
 for Document Images", IEEE WIFS 2025.
 Official code: ``github.com/chenlewis/LC-DF-For-DPAD``.
-
 Taken from the paper / official code
 ------------------------------------
 * The dual-stream decomposition: a **Local Chromaticity** stream and a
@@ -17,10 +16,8 @@ Taken from the paper / official code
   from ``src/engine/FMAG.py``: the amplitude spectrum is split into moire peak
   bands and the remainder, the remainder is scaled by a learnable coefficient,
   the original phase is restored and the image is inverted back::
-
       A_new = A * mask_peaks + alpha * A * (1 - mask_peaks)
       img'  = | ifft2( ifftshift( A_new * exp(i * phase) ) ) |
-
 * Automatic peak localisation: local maxima of the log amplitude, thresholded
   at ``0.6`` times the local maximum, DC neighbourhood and border excluded, and
   four-fold symmetric discs drawn at each peak's radial distance.
@@ -29,7 +26,6 @@ Taken from the paper / official code
 * Adapter-style parameter-efficient training: the pretrained encoders can stay
   frozen while the fusion and head train, which is what
   ``freeze_backbone()`` does here.
-
 Adapted for Stage 1
 -------------------
 * **Not a reproduction.** The paper fuses the streams inside a Swin-B with
@@ -48,7 +44,6 @@ Adapted for Stage 1
   images, and the old dependency stack of the reference code is not carried
   over; only the architecture idea is ported to this repository's environment.
 """
-
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -66,7 +61,6 @@ from ..base import (
 )
 from .chromaticity import ChromaticityMap, ChromaticityNormalization
 from .frequency import FrequencyRepresentation, SpectrumNormalization
-
 DFInput = Literal["fmag", "spectrum"]
 FusionMode = Literal["concat_mlp", "gated"]
 
@@ -78,7 +72,6 @@ class MoireAwareFMAG(nn.Module):
     amplitude by a learnable ``alpha``, then reconstructs an image with the
     original phase. The output is therefore an RGB image in which the periodic
     display-camera signature is relatively enhanced.
-
     Args:
         alpha: Initial attenuation coefficient of the non-peak amplitude.
         alpha_range: Clamp range of ``alpha``. The released trainer clamps it,
@@ -93,7 +86,6 @@ class MoireAwareFMAG(nn.Module):
         max_peaks: Number of strongest peaks kept per sample.
         eps: Numerical floor of the log magnitude.
     """
-
     def __init__(
         self,
         *,
@@ -116,7 +108,6 @@ class MoireAwareFMAG(nn.Module):
             raise ValueError(f"filter_size must be odd, got {filter_size}.")
         if max_peaks <= 0:
             raise ValueError(f"max_peaks must be positive, got {max_peaks}.")
-
         self.alpha_range = (float(low), float(high))
         self.filter_size = int(filter_size)
         self.relative_threshold = float(relative_threshold)
@@ -125,7 +116,6 @@ class MoireAwareFMAG(nn.Module):
         self.min_radius = int(min_radius)
         self.max_peaks = int(max_peaks)
         self.eps = float(eps)
-
         initial = float(min(max(alpha, low), high))
         if learnable_alpha:
             self.alpha = nn.Parameter(torch.tensor(initial, dtype=torch.float32))
@@ -139,7 +129,6 @@ class MoireAwareFMAG(nn.Module):
     @torch.no_grad()
     def peak_mask(self, amplitude: torch.Tensor) -> torch.Tensor:
         """Build the moire peak mask for a centred amplitude spectrum.
-
         Args:
             amplitude: ``(B, C, H, W)`` centred amplitude spectrum.
 
@@ -149,8 +138,9 @@ class MoireAwareFMAG(nn.Module):
         """
         batch, _, height, width = amplitude.shape
         centre_y, centre_x = height // 2, width // 2
-
-        magnitude = torch.log(amplitude.mean(dim=1, keepdim=True) + self.eps)
+        # Official LC&DF FMAG code converts ``img_fft[0]`` to a log spectrum
+        # before peak detection, so use the first channel instead of an RGB mean.
+        magnitude = torch.log(amplitude[:, :1] + self.eps)
         local_max = F.max_pool2d(
             magnitude,
             kernel_size=self.filter_size,
@@ -160,14 +150,12 @@ class MoireAwareFMAG(nn.Module):
         candidates = (magnitude >= local_max) & (
             magnitude > self.relative_threshold * local_max
         )
-
         margin = self.border_margin
         if margin > 0:
             candidates[:, :, :margin, :] = False
             candidates[:, :, -margin:, :] = False
             candidates[:, :, :, :margin] = False
             candidates[:, :, :, -margin:] = False
-
         # Radial distance of every position from DC, used to reject the DC
         # neighbourhood and to place the symmetric discs.
         ys = torch.arange(height, device=amplitude.device).reshape(1, 1, -1, 1)
@@ -176,14 +164,12 @@ class MoireAwareFMAG(nn.Module):
             (ys - centre_y).float() ** 2 + (xs - centre_x).float() ** 2
         )
         candidates &= radius_map > self.min_radius
-
         # Keep the strongest peaks per sample so the mask can be built on GPU.
         scores = torch.where(candidates, magnitude, torch.full_like(magnitude, -torch.inf))
         flat_scores = scores.reshape(batch, -1)
         top = min(self.max_peaks, flat_scores.shape[1])
         best_values, best_indices = flat_scores.topk(top, dim=1)
         valid = torch.isfinite(best_values)
-
         flat_radius = radius_map.reshape(1, -1).expand(batch, -1)
         peak_radii = torch.gather(flat_radius, 1, best_indices).round()
 
@@ -191,7 +177,6 @@ class MoireAwareFMAG(nn.Module):
         grid_y = torch.arange(height, device=amplitude.device).reshape(1, -1, 1).float()
         grid_x = torch.arange(width, device=amplitude.device).reshape(1, 1, -1).float()
         squared_ring = float(self.ring_radius) ** 2
-
         for slot in range(top):
             radii = peak_radii[:, slot].reshape(-1, 1, 1)
             slot_valid = valid[:, slot].reshape(-1, 1, 1)
@@ -201,28 +186,25 @@ class MoireAwareFMAG(nn.Module):
                 distance = (grid_y - centre_py) ** 2 + (grid_x - centre_px) ** 2
                 disc = (distance <= squared_ring) & slot_valid
                 mask[:, 0] = torch.maximum(mask[:, 0], disc.float())
-
         return mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the moire-aware frequency transform.
 
         Args:
-            x: ``(B, 3, H, W)`` linear RGB in ``[0, 1]``.
+            x: ``(B, 3, H, W)`` RGB scaled to ``[0, 1]``.
 
         Returns:
             ``(B, 3, H, W)`` reconstructed image in ``[0, 1]``.
         """
         if x.ndim != 4 or x.shape[1] != 3:
             raise ValueError(f"Expected a (B, 3, H, W) RGB tensor, got shape {tuple(x.shape)}.")
-
         spectrum = torch.fft.fftshift(torch.fft.fft2(x.float(), dim=(-2, -1)), dim=(-2, -1))
         amplitude = spectrum.abs()
         phase = torch.angle(spectrum)
 
         mask = self.peak_mask(amplitude)
         alpha = self.alpha.clamp(*self.alpha_range)
-
         # A_new = A * mask + alpha * A * (1 - mask)
         new_amplitude = amplitude * mask + alpha * amplitude * (1.0 - mask)
         restored = torch.fft.ifft2(
@@ -234,10 +216,8 @@ class MoireAwareFMAG(nn.Module):
         )
         return restored.abs().clamp(0.0, 1.0).to(x.dtype)
 
-
 class DualStreamFusion(nn.Module):
     """Fuse the chromaticity and frequency features into one embedding.
-
     Args:
         lc_dim: Chromaticity feature dimension.
         df_dim: Frequency feature dimension.
@@ -247,7 +227,6 @@ class DualStreamFusion(nn.Module):
             gates, which makes the stream contribution inspectable.
         dropout: Dropout inside the fusion MLP.
     """
-
     def __init__(
         self,
         lc_dim: int,
@@ -263,7 +242,6 @@ class DualStreamFusion(nn.Module):
 
         self.mode = mode
         self.out_dim = int(out_dim)
-
         if mode == "concat_mlp":
             self.project = nn.Sequential(
                 nn.Linear(lc_dim + df_dim, self.out_dim),
@@ -279,7 +257,6 @@ class DualStreamFusion(nn.Module):
                 nn.Sigmoid(),
             )
             self.dropout = nn.Dropout(dropout)
-
     def forward(self, lc_features: torch.Tensor, df_features: torch.Tensor) -> torch.Tensor:
         joint = torch.cat([lc_features, df_features], dim=1)
         if self.mode == "concat_mlp":
@@ -290,10 +267,8 @@ class DualStreamFusion(nn.Module):
         fused = lc_gate * self.lc_project(lc_features) + df_gate * self.df_project(df_features)
         return self.dropout(fused)
 
-
 class LCDFDualStreamClassifier(Stage1Model):
     """LC&DF-inspired dual-stream Stage 1 classifier.
-
     Args:
         num_classes: Output classes.
         chromaticity_normalize: LC representation variant.
@@ -308,10 +283,8 @@ class LCDFDualStreamClassifier(Stage1Model):
         patch_size: Expected patch size.
         learnable_alpha: Optimise the FMAG attenuation coefficient.
     """
-
     model_name: ClassVar[str] = "lcdf"
     input_kind: ClassVar[str] = "patch"
-
     def __init__(
         self,
         *,
@@ -330,7 +303,6 @@ class LCDFDualStreamClassifier(Stage1Model):
         super().__init__()
         if df_input not in ("fmag", "spectrum"):
             raise ValueError(f"df_input must be 'fmag' or 'spectrum', got {df_input!r}.")
-
         self.patch_size = int(patch_size)
         self.df_input = df_input
 
@@ -339,7 +311,6 @@ class LCDFDualStreamClassifier(Stage1Model):
         self.lc_encoder = build_patch_encoder(
             encoder, in_channels=self.chromaticity.out_channels, pretrained=pretrained
         )
-
         if df_input == "fmag":
             self.df_representation: nn.Module = MoireAwareFMAG(
                 learnable_alpha=learnable_alpha
@@ -354,7 +325,6 @@ class LCDFDualStreamClassifier(Stage1Model):
             in_channels=int(self.df_representation.out_channels),
             pretrained=pretrained,
         )
-
         self.fusion = DualStreamFusion(
             int(self.lc_encoder.out_channels),
             int(self.df_encoder.out_channels),
@@ -368,11 +338,9 @@ class LCDFDualStreamClassifier(Stage1Model):
     @property
     def feature_dim(self) -> int:
         return self._feature_dim
-
     @property
     def blocks(self) -> Sequence[nn.Module]:
         """Paired blocks of the two streams, shallow to deep.
-
         Each element groups the ``i``-th block of both encoders, so
         ``unfreeze_last_n_blocks(n)`` unfreezes the last ``n`` stages of both
         streams symmetrically.
@@ -383,7 +351,6 @@ class LCDFDualStreamClassifier(Stage1Model):
             nn.ModuleList([lc_block, df_block])
             for lc_block, df_block in zip(lc_blocks, df_blocks)
         ]
-
     def head_parameters(self) -> Iterable[nn.Parameter]:
         parameters = list(self.head.parameters()) + list(self.fusion.parameters())
         if isinstance(self.df_representation, MoireAwareFMAG) and isinstance(
@@ -394,7 +361,6 @@ class LCDFDualStreamClassifier(Stage1Model):
 
     def backbone_modules(self) -> Iterable[nn.Module]:
         return [self.lc_encoder, self.df_encoder]
-
     def stream_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Return both stream embeddings before fusion, for diagnostics."""
         return {
@@ -405,7 +371,6 @@ class LCDFDualStreamClassifier(Stage1Model):
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         streams = self.stream_features(x)
         return self.fusion(streams["lc"], streams["df"])
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.extract_features(x))
 
@@ -417,9 +382,8 @@ class LCDFDualStreamClassifier(Stage1Model):
             "representation": (
                 f"chromaticity({self.chromaticity.normalize}) + df({self.df_input})"
             ),
-            "notes": "Linear RGB in [0, 1]; no resize before cropping.",
+            "notes": "RGB scaled to [0, 1]; no resize before cropping.",
         }
-
 
 __all__ = [
     "DFInput",

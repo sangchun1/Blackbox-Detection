@@ -3,7 +3,6 @@ name = "blackbox-detection"
 version = "0.1.0"
 description = "DACON blackbox intentional accident detection"
 requires-python = ">=3.10,<3.13"
-
 # Development / training environment.
 #
 # Packages already provided by the DACON evaluation server are pinned to the
@@ -18,7 +17,6 @@ dependencies = [
     # PyTorch
     "torch==2.8.0",
     "torchvision==0.23.0",
-
     # Core scientific stack
     "numpy==1.26.4",
     "pandas==2.2.2",
@@ -39,7 +37,7 @@ dependencies = [
     "iopath==0.1.10",
     "yacs==0.1.8",
     "einops==0.8.1",
-
+    "easydict==1.13",
     # Hugging Face / foundation-model stack
     "transformers==4.57.6",
     "accelerate==1.9.0",
@@ -57,7 +55,6 @@ dependencies = [
     # Experiment tracking (development only; do not import in submission inference)
     "wandb==0.29.0",
 ]
-
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

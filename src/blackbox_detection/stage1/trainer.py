@@ -4,7 +4,6 @@ One loop serves both branches. The video/forensic difference is confined to the
 :class:`~.dataset.Stage1BatchAdapter` that flattens a batch into units, so the
 loop itself contains no ``if video ... else forensic ...``: it always sees
 ``(N, ...)`` inputs and ``(N,)`` targets.
-
 Provided here: AMP, gradient accumulation, AdamW with parameter-group weight
 decay, warmup plus cosine schedule, best-checkpoint selection on validation
 Macro-F1, optional early stopping, W&B logging and a training-history CSV.
@@ -15,7 +14,6 @@ searched threshold.
 """
 
 from __future__ import annotations
-
 import json
 import math
 import time
@@ -28,7 +26,6 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-
 from ..utils.checkpoint import save_latest_and_best
 from ..utils.logging import create_progress_bar, log_metrics, setup_logger
 from ..utils.seed import DEFAULT_SEED
@@ -43,7 +40,6 @@ PREDICTIONS_FILENAME = "val_predictions.csv"
 @dataclass
 class TrainConfig:
     """Stage 1 training configuration.
-
     Attributes:
         epochs: Number of epochs.
         learning_rate: Peak learning rate of the parameter groups.
@@ -69,7 +65,6 @@ class TrainConfig:
         wandb_enabled: Log metrics to an already initialised W&B run.
         save_predictions: Write ``val_predictions.csv`` for the best epoch.
     """
-
     epochs: int = 10
     learning_rate: float = 1e-4
     head_learning_rate: float | None = None
@@ -89,7 +84,6 @@ class TrainConfig:
     model_name: str = "stage1_model"
     wandb_enabled: bool = False
     save_predictions: bool = True
-
     def __post_init__(self) -> None:
         if self.epochs <= 0:
             raise ValueError(f"epochs must be positive, got {self.epochs}.")
@@ -99,7 +93,6 @@ class TrainConfig:
             raise ValueError(f"warmup_ratio must be in [0, 1), got {self.warmup_ratio}.")
         if self.eval_every <= 0:
             raise ValueError(f"eval_every must be positive, got {self.eval_every}.")
-
 
 @dataclass
 class TrainingOutcome:
@@ -113,7 +106,6 @@ class TrainingOutcome:
     best_checkpoint: Path | None
     best_result: EvaluationResult | None = field(default=None, repr=False)
 
-
 def build_parameter_groups(
     model: nn.Module,
     *,
@@ -123,7 +115,6 @@ def build_parameter_groups(
     head_parameters: Iterable[nn.Parameter] | None = None,
 ) -> list[dict[str, Any]]:
     """Split trainable parameters into decay / no-decay (and head) groups.
-
     Biases and one-dimensional parameters (norm weights, learned scalars) are
     excluded from weight decay, which is standard for transformer fine-tuning
     and matters here because the head is tiny compared to the backbone.
@@ -134,11 +125,9 @@ def build_parameter_groups(
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-
         is_head = id(parameter) in head_ids
         no_decay = parameter.ndim <= 1 or name.endswith(".bias")
         key = f"{'head' if is_head else 'backbone'}_{'no_decay' if no_decay else 'decay'}"
-
         if key not in groups:
             groups[key] = {
                 "params": [],
@@ -151,14 +140,12 @@ def build_parameter_groups(
                 "name": key,
             }
         groups[key]["params"].append(parameter)
-
     if not groups:
         raise ValueError(
             "No trainable parameters found. Check the fine-tuning mode: "
             "'head_only' still requires a trainable head."
         )
     return list(groups.values())
-
 
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
@@ -170,7 +157,6 @@ def build_scheduler(
     """Linear warmup followed by cosine decay to ``min_ratio`` of the peak rate."""
     total = max(int(total_steps), 1)
     warmup = max(int(round(total * warmup_ratio)), 0)
-
     def lr_lambda(step: int) -> float:
         if warmup > 0 and step < warmup:
             return (step + 1) / warmup
@@ -184,7 +170,6 @@ def build_scheduler(
 
 class Stage1Trainer:
     """Train one Stage 1 model and keep the best-scoring checkpoint.
-
     Args:
         model: Any :class:`~.models.base.Stage1Model`.
         config: Training configuration.
@@ -195,7 +180,6 @@ class Stage1Trainer:
             be rebuilt from the checkpoint alone.
         logger: Optional pre-configured logger.
     """
-
     def __init__(
         self,
         model: nn.Module,
@@ -215,14 +199,12 @@ class Stage1Trainer:
         self.model = model.to(self.device)
         self.aggregation = aggregation or AggregationConfig()
         self.model_config = dict(model_config or {})
-
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logger or setup_logger(
             f"blackbox_detection.stage1.{config.model_name}",
             log_file=self.output_dir / "train.log",
         )
-
         self.amp = bool(config.amp) and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.amp)
         weights = (
@@ -241,7 +223,6 @@ class Stage1Trainer:
             aggregation=self.aggregation,
         )
         self.history: list[dict[str, Any]] = []
-
     # Training ---------------------------------------------------------------
 
     def _train_one_epoch(
@@ -256,24 +237,40 @@ class Stage1Trainer:
         running_loss = 0.0
         seen_units = 0
         num_batches = len(loader)
-
         progress = create_progress_bar(
             loader, desc=f"Train {epoch}/{self.config.epochs}", leave=False
         )
         optimizer.zero_grad(set_to_none=True)
+        micro_batches_since_step = 0
+        skipped_invalid_batches = 0
 
         for step, batch in enumerate(progress):
             adapted = self.adapter.unpack(batch, self.device)
-            with torch.autocast(
-                device_type=self.device.type, dtype=torch.float16, enabled=self.amp
-            ):
-                logits = self.model(adapted.inputs)
-                loss = self.criterion(logits, adapted.targets)
+            valid_mask = adapted.valid_mask
+            has_valid_units = bool(valid_mask.any().item())
 
-            self.scaler.scale(loss / accumulation).backward()
+            if has_valid_units:
+                inputs = adapted.inputs[valid_mask]
+                targets = adapted.targets[valid_mask]
+                with torch.autocast(
+                    device_type=self.device.type, dtype=torch.float16, enabled=self.amp
+                ):
+                    logits = self.model(inputs)
+                    loss = self.criterion(logits, targets)
+
+                self.scaler.scale(loss / accumulation).backward()
+                micro_batches_since_step += 1
+                units = int(targets.numel())
+                running_loss += float(loss.detach()) * units
+                seen_units += units
+            else:
+                skipped_invalid_batches += 1
 
             is_last = step + 1 == num_batches
-            if (step + 1) % accumulation == 0 or is_last:
+            should_step = micro_batches_since_step > 0 and (
+                micro_batches_since_step >= accumulation or is_last
+            )
+            if should_step:
                 if self.config.max_grad_norm > 0:
                     self.scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -288,24 +285,31 @@ class Stage1Trainer:
                 self.scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
-
+                micro_batches_since_step = 0
                 # Models with weight constraints (Bayar) re-project here.
                 hook = getattr(self.model, "on_after_optimizer_step", None)
                 if callable(hook):
                     hook()
 
-            units = int(adapted.targets.numel())
-            running_loss += float(loss.detach()) * units
-            seen_units += units
             if self.config.log_interval and (step + 1) % self.config.log_interval == 0:
                 progress.set_postfix(loss=f"{running_loss / max(seen_units, 1):.4f}")
 
         progress.close()
+        if seen_units == 0:
+            raise RuntimeError(
+                "Training epoch contained no valid decoded units. "
+                "Inspect broken videos / decoder errors before continuing."
+            )
+        if skipped_invalid_batches:
+            self.logger.warning(
+                "Skipped %d batch(es) containing no valid decoded units in epoch %d.",
+                skipped_invalid_batches,
+                epoch,
+            )
         return {
-            "train_loss": running_loss / max(seen_units, 1),
+            "train_loss": running_loss / seen_units,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
-
     def fit(
         self,
         train_loader: DataLoader,
@@ -315,14 +319,12 @@ class Stage1Trainer:
         resume_from: str | Path | None = None,
     ) -> TrainingOutcome:
         """Train, validate every ``eval_every`` epochs and keep the best model.
-
         Args:
             train_loader: Training loader.
             val_loader: Validation loader over held-out **videos**.
             subsets: Named ``video_id`` subsets for controlled diagnostics
                 (VAL-B now, VAL-DLC / VAL-CCD later).
             resume_from: Optional checkpoint to resume from.
-
         Returns:
             A :class:`TrainingOutcome`.
         """
@@ -347,7 +349,6 @@ class Stage1Trainer:
             warmup_ratio=config.warmup_ratio,
             min_ratio=config.min_learning_rate_ratio,
         )
-
         start_epoch = 1
         best_score = -math.inf
         best_threshold = 0.5
@@ -358,7 +359,6 @@ class Stage1Trainer:
 
         if resume_from is not None:
             from ..utils.checkpoint import load_checkpoint
-
             metadata = load_checkpoint(
                 resume_from,
                 model=self.model,
@@ -369,8 +369,37 @@ class Stage1Trainer:
             )
             start_epoch = int(metadata.get("epoch") or 0) + 1
             best_score = float(metadata.get("best_score") or -math.inf)
-            self.logger.info("Resumed from %s at epoch %d.", resume_from, start_epoch)
+            extra = dict(metadata.get("extra") or {})
+            best_threshold = float(extra.get("best_threshold", 0.5))
+            best_epoch = int(extra.get("best_epoch") or metadata.get("epoch") or 0)
 
+            resume_dir = Path(resume_from).parent
+            candidate_best = resume_dir / "best.pt"
+            if candidate_best.is_file():
+                best_checkpoint = candidate_best
+
+            history_path = resume_dir / HISTORY_FILENAME
+            if history_path.is_file():
+                previous_history = pd.read_csv(history_path)
+                if len(previous_history):
+                    self.history = previous_history.to_dict(orient="records")
+                    if "val_macro_f1" in previous_history.columns:
+                        scored = previous_history.dropna(subset=["val_macro_f1"])
+                        if len(scored):
+                            best_row = scored.loc[scored["val_macro_f1"].idxmax()]
+                            best_epoch = int(best_row["epoch"])
+                            best_threshold = float(
+                                best_row.get("val_threshold", best_threshold)
+                            )
+            epochs_without_improvement = max(0, start_epoch - 1 - best_epoch)
+            self.logger.info(
+                "Resumed from %s at epoch %d (best epoch %d, F1 %.4f, threshold %.3f).",
+                resume_from,
+                start_epoch,
+                best_epoch,
+                best_score,
+                best_threshold,
+            )
         (self.output_dir / CONFIG_FILENAME).write_text(
             json.dumps(
                 {
@@ -387,12 +416,10 @@ class Stage1Trainer:
             ),
             encoding="utf-8",
         )
-
         for epoch in range(start_epoch, config.epochs + 1):
             started = time.perf_counter()
             metrics = self._train_one_epoch(train_loader, optimizer, scheduler, epoch)
             record: dict[str, Any] = {"epoch": epoch, **metrics}
-
             if epoch % config.eval_every == 0 or epoch == config.epochs:
                 result = self.evaluator.evaluate(val_loader, subsets=subsets)
                 assert isinstance(result, EvaluationResult)
@@ -406,7 +433,6 @@ class Stage1Trainer:
                 )
                 for name, payload in result.subset_scores.items():
                     record[f"val_macro_f1_{name}"] = payload.get("macro_f1")
-
                 improved = result.macro_f1 > best_score
                 if improved:
                     best_score = float(result.macro_f1)
@@ -416,7 +442,6 @@ class Stage1Trainer:
                     epochs_without_improvement = 0
                 else:
                     epochs_without_improvement += config.eval_every
-
                 paths = save_latest_and_best(
                     self.output_dir,
                     model=self.model,
@@ -434,7 +459,9 @@ class Stage1Trainer:
                         "model_name": config.model_name,
                         "input_kind": getattr(self.model, "input_kind", None),
                         "val_macro_f1": float(result.macro_f1),
-                        "best_threshold": float(result.threshold),
+                        "val_threshold": float(result.threshold),
+                        "best_threshold": float(best_threshold),
+                        "best_epoch": int(best_epoch),
                         "aggregation": asdict(self.aggregation),
                         "preprocessing": dict(
                             self.model.preprocessing()
@@ -449,7 +476,6 @@ class Stage1Trainer:
                         save_predictions(
                             result.predictions, self.output_dir / PREDICTIONS_FILENAME
                         )
-
                 self.logger.info(
                     "Epoch %d | loss %.4f | val Macro-F1 %.4f @ thr %.3f (0.5: %.4f)%s",
                     epoch,
@@ -469,13 +495,11 @@ class Stage1Trainer:
                 )
                 if config.wandb_enabled:
                     log_metrics({"train/loss": metrics["train_loss"]}, step=epoch)
-
             record["epoch_seconds"] = time.perf_counter() - started
             self.history.append(record)
             pd.DataFrame(self.history).to_csv(
                 self.output_dir / HISTORY_FILENAME, index=False, encoding="utf-8"
             )
-
             if (
                 config.early_stopping_patience
                 and epochs_without_improvement >= config.early_stopping_patience
@@ -485,13 +509,11 @@ class Stage1Trainer:
                     epochs_without_improvement,
                 )
                 break
-
         if best_epoch == 0:
             raise RuntimeError(
                 "Training finished without a single validation pass; check "
                 "eval_every and the number of epochs."
             )
-
         self.logger.info(
             "Best epoch %d with validation Macro-F1 %.4f at threshold %.3f.",
             best_epoch,
@@ -507,7 +529,6 @@ class Stage1Trainer:
             best_checkpoint=best_checkpoint,
             best_result=best_result,
         )
-
 
 __all__ = [
     "HISTORY_FILENAME",
