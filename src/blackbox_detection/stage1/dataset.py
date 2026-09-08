@@ -30,7 +30,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from ..utils.seed import DEFAULT_SEED, dataloader_seed_kwargs
-from .manifest import STAGE1_LABEL_TO_INDEX
 from .sampling import ClipSampler, FrameSampler, PatchSampler
 from .transforms import pad_to_min_size
 
@@ -38,6 +37,15 @@ ErrorPolicy = Literal["raise", "zero"]
 VideoTransform = Callable[[np.ndarray, np.random.Generator | None], torch.Tensor]
 PatchTransform = Callable[[np.ndarray, np.random.Generator | None], torch.Tensor]
 
+STAGE1_LABEL_TO_INDEX = {
+    "ORIGINAL": 0,
+    "RERECORDED": 1,
+}
+
+STAGE1_INDEX_TO_LABEL = {
+    0: "ORIGINAL",
+    1: "RERECORDED",
+}
 
 class VideoDecodeError(RuntimeError):
     """Raised when a video cannot be opened or a requested frame cannot decode."""

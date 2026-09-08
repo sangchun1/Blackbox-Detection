@@ -30,8 +30,7 @@ import torch
 from torch import nn
 
 from ..utils.metrics import STAGE1_LABELS, stage1_score
-from .dataset import Stage1BatchAdapter
-from .manifest import STAGE1_INDEX_TO_LABEL, STAGE1_LABEL_TO_INDEX
+from .dataset import Stage1BatchAdapter, STAGE1_INDEX_TO_LABEL, STAGE1_LABEL_TO_INDEX
 PREDICTION_COLUMNS: tuple[str, ...] = (
     "video_id",
     "label",

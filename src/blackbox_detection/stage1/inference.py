@@ -36,12 +36,6 @@ from .dataset import (
     video_batch_adapter,
 )
 from .evaluator import AggregationConfig, Stage1Evaluator, finalize_predictions
-from .manifest import (
-    STAGE1_MANIFEST_COLUMNS,
-    VIDEO_EXTENSIONS,
-    iter_video_files,
-    probe_video_metadata,
-)
 from .models import Stage1Model, build_stage1_model, model_input_kind
 from .sampling import build_clip_sampler, build_forensic_samplers
 from .transforms import ForensicPatchTransform, ValClipTransform
@@ -163,61 +157,61 @@ def load_stage1_model(
         metadata=extra,
     )
 
-def manifest_from_videos(
-    videos: Sequence[str | Path] | str | Path,
-    *,
-    dataset: str = "inference",
-    scene_type: str = "",
-    probe_metadata: bool = True,
-) -> pd.DataFrame:
-    """Build a minimal manifest for inference from paths or a directory.
-    Labels are unknown at inference time and are filled with ``"ORIGINAL"``
-    purely so the dataset's label mapping is satisfied. They are never used for
-    scoring here.
-    """
-    if isinstance(videos, (str, Path)) and Path(videos).is_dir():
-        paths = iter_video_files(videos, extensions=VIDEO_EXTENSIONS)
-    elif isinstance(videos, (str, Path)):
-        paths = [Path(videos)]
-    else:
-        paths = [Path(video) for video in videos]
-    if not paths:
-        raise ValueError("No videos found for inference.")
+# def manifest_from_videos(
+#     videos: Sequence[str | Path] | str | Path,
+#     *,
+#     dataset: str = "inference",
+#     scene_type: str = "",
+#     probe_metadata: bool = True,
+# ) -> pd.DataFrame:
+#     """Build a minimal manifest for inference from paths or a directory.
+#     Labels are unknown at inference time and are filled with ``"ORIGINAL"``
+#     purely so the dataset's label mapping is satisfied. They are never used for
+#     scoring here.
+#     """
+#     if isinstance(videos, (str, Path)) and Path(videos).is_dir():
+#         paths = iter_video_files(videos, extensions=VIDEO_EXTENSIONS)
+#     elif isinstance(videos, (str, Path)):
+#         paths = [Path(videos)]
+#     else:
+#         paths = [Path(video) for video in videos]
+#     if not paths:
+#         raise ValueError("No videos found for inference.")
 
-    resolved_paths = [Path(path).resolve() for path in paths]
-    path_strings = [str(path) for path in resolved_paths]
-    if len(set(path_strings)) != len(path_strings):
-        raise ValueError("The same inference video path was provided more than once.")
+#     resolved_paths = [Path(path).resolve() for path in paths]
+#     path_strings = [str(path) for path in resolved_paths]
+#     if len(set(path_strings)) != len(path_strings):
+#         raise ValueError("The same inference video path was provided more than once.")
 
-    stem_counts = Counter(path.stem for path in resolved_paths)
-    rows: list[dict[str, Any]] = []
-    for path in resolved_paths:
-        stem = path.stem
-        if stem_counts[stem] == 1:
-            video_id = stem
-        else:
-            digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]
-            video_id = f"{stem}_{digest}"
+#     stem_counts = Counter(path.stem for path in resolved_paths)
+#     rows: list[dict[str, Any]] = []
+#     for path in resolved_paths:
+#         stem = path.stem
+#         if stem_counts[stem] == 1:
+#             video_id = stem
+#         else:
+#             digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]
+#             video_id = f"{stem}_{digest}"
 
-        row: dict[str, Any] = {
-            "video_path": str(path),
-            "label": "ORIGINAL",  # placeholder, unused
-            "dataset": dataset,
-            "video_id": video_id,
-            "source_video_id": "",
-            "scene_type": scene_type,
-            "is_synthetic": False,
-            "capture_device": "",
-            "display_device": "",
-        }
-        if probe_metadata:
-            row.update(probe_video_metadata(path, verify_decode=False).as_dict())
-        rows.append(row)
-    frame = pd.DataFrame(rows)
-    for column in STAGE1_MANIFEST_COLUMNS:
-        if column not in frame.columns:
-            frame[column] = ""
-    return frame
+#         row: dict[str, Any] = {
+#             "video_path": str(path),
+#             "label": "ORIGINAL",  # placeholder, unused
+#             "dataset": dataset,
+#             "video_id": video_id,
+#             "source_video_id": "",
+#             "scene_type": scene_type,
+#             "is_synthetic": False,
+#             "capture_device": "",
+#             "display_device": "",
+#         }
+#         if probe_metadata:
+#             row.update(probe_video_metadata(path, verify_decode=False).as_dict())
+#         rows.append(row)
+#     frame = pd.DataFrame(rows)
+#     for column in STAGE1_MANIFEST_COLUMNS:
+#         if column not in frame.columns:
+#             frame[column] = ""
+#     return frame
 
 def _build_loader(
     loaded: LoadedStage1Model,
@@ -315,10 +309,10 @@ def predict_stage1_proba(
             model_or_checkpoint, device=device, model_params=model_params
         )
     )
-    manifest = videos if isinstance(videos, pd.DataFrame) else manifest_from_videos(videos)
+    # manifest = videos if isinstance(videos, pd.DataFrame) else manifest_from_videos(videos)
     loader, adapter = _build_loader(
         loaded,
-        manifest,
+        # manifest,
         batch_size=batch_size,
         num_workers=num_workers,
         num_clips=num_clips,
@@ -368,7 +362,7 @@ def predict_stage1(
 __all__ = [
     "LoadedStage1Model",
     "load_stage1_model",
-    "manifest_from_videos",
+    # "manifest_from_videos",
     "predict_stage1_proba",
     "predict_stage1",
 ]

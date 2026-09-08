@@ -14,13 +14,13 @@ level:
 
 Data flow::
 
-    manifest.py  ->  split.py  ->  sampling.py + transforms.py  ->  dataset.py
-                                                                       |
-                                                            models/factory.py
-                                                                       |
-                                            trainer.py  ->  evaluator.py
-                                                                       |
-                                                  fusion.py / inference.py
+    sampling.py + transforms.py  ->  dataset.py
+                                            |
+                                models/factory.py
+                                            |
+                trainer.py  ->  evaluator.py
+                                            |
+                        fusion.py / inference.py
 
 Current data is DLC-2021 only (``or`` -> ORIGINAL, ``re`` -> RERECORDED). The
 manifest, split and dataset layers are dataset-agnostic on purpose: adding the
@@ -72,23 +72,6 @@ from .inference import (
     predict_stage1,
     predict_stage1_proba,
 )
-from .manifest import (
-    STAGE1_DIAGNOSTIC_COLUMNS,
-    STAGE1_INDEX_TO_LABEL,
-    STAGE1_LABEL_TO_INDEX,
-    STAGE1_MANIFEST_COLUMNS,
-    broken_videos,
-    drop_broken_videos,
-    filter_manifest,
-    load_manifest,
-    manifest_summary,
-    merge_manifests,
-    probe_video_metadata,
-    save_manifest,
-    scan_dlc2021,
-    scan_video_directory,
-    validate_manifest,
-)
 from .models import (
     STAGE1_MODEL_NAMES,
     Stage1Model,
@@ -106,17 +89,6 @@ from .sampling import (
     build_clip_sampler,
     build_forensic_samplers,
 )
-from .split import (
-    SplitConfig,
-    ValidationSubsetSpec,
-    apply_split,
-    build_validation_subsets,
-    load_split,
-    make_video_level_split,
-    resolution_subset_spec,
-    save_split,
-    split_summary,
-)
 from .trainer import Stage1Trainer, TrainConfig, TrainingOutcome
 from .transforms import (
     ClipAugmentConfig,
@@ -130,32 +102,6 @@ from .transforms import (
 )
 
 __all__ = [
-    # manifest
-    "STAGE1_MANIFEST_COLUMNS",
-    "STAGE1_DIAGNOSTIC_COLUMNS",
-    "STAGE1_LABEL_TO_INDEX",
-    "STAGE1_INDEX_TO_LABEL",
-    "scan_dlc2021",
-    "scan_video_directory",
-    "merge_manifests",
-    "validate_manifest",
-    "broken_videos",
-    "drop_broken_videos",
-    "filter_manifest",
-    "manifest_summary",
-    "probe_video_metadata",
-    "save_manifest",
-    "load_manifest",
-    # split
-    "SplitConfig",
-    "ValidationSubsetSpec",
-    "make_video_level_split",
-    "apply_split",
-    "split_summary",
-    "build_validation_subsets",
-    "resolution_subset_spec",
-    "save_split",
-    "load_split",
     # sampling
     "DenseClipSampler",
     "DeterministicClipSampler",
