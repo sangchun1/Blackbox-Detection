@@ -1,0 +1,63 @@
+# V1: VideoMAEv2-B video branch (Phase 1).
+
+model:
+  name: videomaev2_b
+  finetune_mode: last_n        # head_only | last_n | full
+  unfreeze_last_n: 4
+  params:
+    hf_model_id: OpenGVLab/VideoMAEv2-Base
+    backend: hf_remote
+    # Local official .pth (e.g. vit_b_k710_dl_from_giant.pth) to load instead of
+    # the Hugging Face weights. Leave null to use the hub weights.
+    pretrained_path: null
+    local_files_only: false
+    num_frames: 16
+    input_size: 224
+    num_classes: 2
+    dropout: 0.0
+    # mean/std are resolved from the checkpoint's own processor. Do not invent
+    # normalisation values here.
+
+data:
+  # Dense temporal sampling; the training stride is drawn per clip.
+  num_frames: 16
+  train_strides: [1, 2, 4]
+  val_stride: 2
+  train_num_clips: 1
+  val_num_clips: 1             # raise for multi-clip validation/inference
+  batch_size: 4
+  val_batch_size: 4
+  num_workers: 4
+
+augmentation:
+  # Every parameter is drawn once per clip; per-frame jitter would create
+  # artificial flicker.
+  crop_size: 224
+  scale_range: [0.7, 1.0]
+  ratio_range: [0.9, 1.1111]
+  hflip_prob: 0.5
+  brightness: 0.1
+  contrast: 0.1
+  perspective_prob: 0.2
+  perspective_scale: 0.02
+
+train:
+  epochs: 10
+  learning_rate: 1.0e-4
+  head_learning_rate: 1.0e-3
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  amp: true
+  label_smoothing: 0.0
+  early_stopping_patience: 4
+  eval_every: 1
+  seed: 42
+  output_dir: outputs/stage1/videomaev2_b
+
+evaluation:
+  aggregation:
+    frame_method: mean
+    video_method: mean
+  search_threshold: true

@@ -1,0 +1,72 @@
+# V2: V-JEPA 2.1-B video branch (Phase 7, after the VideoMAEv2 pipeline is
+# validated).
+#
+# V-JEPA 2.1 is not supported by transformers, so the encoder is built from a
+# local clone of https://github.com/facebookresearch/vjepa2 and the official
+# checkpoint is loaded from disk. Both paths are machine specific; set them
+# locally. Inference never downloads anything.
+
+model:
+  name: vjepa2_1_b
+  finetune_mode: head_only     # attentive probe first, then last_n
+  unfreeze_last_n: 0
+  params:
+    source_root: null          # local facebookresearch/vjepa2 clone
+    arch: vit_base
+    # Local copy of
+    # https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitb_dist_vitG_384.pt
+    checkpoint_path: null
+    checkpoint_key: ema_encoder
+    allow_download: false
+    # Geometry the official checkpoint was built with; do not change unless the
+    # checkpoint specification changes.
+    build_img_size: 384
+    build_num_frames: 64
+    # Runtime geometry. High spatial resolution is this backbone's advantage;
+    # RoPE interpolation allows fewer frames than the build-time count.
+    input_size: 384
+    input_frames: 16
+    pooling: attentive         # attentive | mean
+    num_classes: 2
+    dropout: 0.0
+    strict_load: true
+
+data:
+  num_frames: 16
+  train_strides: [1, 2, 4]
+  val_stride: 2
+  train_num_clips: 1
+  val_num_clips: 1
+  batch_size: 1
+  val_batch_size: 1
+  num_workers: 4
+
+augmentation:
+  crop_size: 384
+  scale_range: [0.7, 1.0]
+  ratio_range: [0.9, 1.1111]
+  hflip_prob: 0.5
+  brightness: 0.1
+  contrast: 0.1
+  perspective_prob: 0.2
+  perspective_scale: 0.02
+
+train:
+  epochs: 10
+  learning_rate: 5.0e-5
+  head_learning_rate: 1.0e-3
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  grad_accum_steps: 16
+  max_grad_norm: 1.0
+  amp: true
+  early_stopping_patience: 4
+  eval_every: 1
+  seed: 42
+  output_dir: outputs/stage1/vjepa2_1_b
+
+evaluation:
+  aggregation:
+    frame_method: mean
+    video_method: mean
+  search_threshold: true

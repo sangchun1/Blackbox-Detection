@@ -1,0 +1,128 @@
+# Forensic branch (F1..F5). One config drives every forensic model; switch
+# MODEL_NAME in scripts/stage1/02_train_forensic.ipynb.
+#
+# Recommended execution order (implementation numbering and experiment order
+# differ on purpose - the screen-recapture-specific branches come first):
+#   bayar_resnet18 -> chromaticity -> frequency -> lcdf -> cdc
+#
+# Patches are cropped from native-resolution frames. Never resize a frame
+# before cropping: that destroys the moire/aliasing/sub-pixel traces.
+
+defaults:
+  data:
+    patch_size: 256
+    train_num_frames: 2
+    train_num_patches: 4
+    val_num_frames: 4
+    val_num_patches: 4
+    val_patch_grid: 3
+    batch_size: 8               # videos per batch; patches per step = batch * frames * patches
+    val_batch_size: 4
+    num_workers: 4
+
+  augmentation:
+    hflip_prob: 0.5
+    vflip_prob: 0.0
+    # Off by default: rotation changes moire orientation, which is a cue rather
+    # than a nuisance.
+    rot90_prob: 0.0
+    # FMAG-inspired moire spectral augmentation; enable for F4/F5 experiments.
+    spectral_augment_prob: 0.0
+    spectral_augment_alpha_range: [0.5, 0.8]
+    spectral_augment_beta_std: 1.0
+    spectral_augment_keep_outside: false
+
+  train:
+    epochs: 15
+    learning_rate: 1.0e-4
+    head_learning_rate: 1.0e-3
+    weight_decay: 0.01
+    warmup_ratio: 0.1
+    grad_accum_steps: 1
+    max_grad_norm: 1.0
+    amp: true
+    label_smoothing: 0.0
+    early_stopping_patience: 5
+    eval_every: 1
+    seed: 42
+
+  evaluation:
+    # patch -> frame -> video. Mean probability is the initial choice; a learned
+    # aggregator can be registered in evaluator.AGGREGATORS later.
+    aggregation:
+      frame_method: mean
+      video_method: mean
+    search_threshold: true
+
+# Per-model overrides, merged onto `defaults`.
+models:
+  bayar_resnet18:
+    model:
+      name: bayar_resnet18
+      finetune_mode: last_n
+      unfreeze_last_n: 2
+      params:
+        num_bayar_filters: 3
+        kernel_size: 5
+        constraint_mode: reparam   # reparam | project (paper's projection)
+        encoder: resnet18
+        pretrained: true
+        dropout: 0.1
+        patch_size: 256
+
+  chromaticity:
+    model:
+      name: chromaticity
+      finetune_mode: last_n
+      unfreeze_last_n: 2
+      params:
+        normalize: lcdf            # zscore (CMA) | lcdf | none
+        encoder: resnet18
+        pretrained: true
+        dropout: 0.1
+        patch_size: 256
+
+  frequency:
+    model:
+      name: frequency
+      finetune_mode: full
+      unfreeze_last_n: 0
+      params:
+        encoder: small_cnn         # ImageNet priors transfer poorly to a spectrum
+        pretrained: false
+        log_scale: true
+        normalize: standardize
+        grayscale: false
+        dropout: 0.1
+        patch_size: 256
+    augmentation:
+      spectral_augment_prob: 0.3
+
+  lcdf:
+    model:
+      name: lcdf
+      finetune_mode: last_n
+      unfreeze_last_n: 2
+      params:
+        chromaticity_normalize: lcdf
+        df_input: fmag             # fmag (paper's DF input) | spectrum (reuses F4)
+        encoder: resnet18
+        pretrained: true
+        fusion: concat_mlp         # concat_mlp | gated
+        fusion_dim: 512
+        dropout: 0.1
+        patch_size: 256
+        learnable_alpha: true
+
+  cdc:
+    model:
+      name: cdc
+      finetune_mode: full
+      unfreeze_last_n: 0
+      params:
+        theta: 0.7
+        stem_channels: 32
+        widths: [64, 128, 256]
+        dropout: 0.1
+        patch_size: 256
+        normalize_input: true
