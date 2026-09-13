@@ -13,3 +13,10 @@
 | B3     | DLC + CCD-OR | Best forensic #2           | same setting             |            |                |              |             |               |            |          | optional       |
 | B4     | DLC + CCD-OR | V-JEPA 2.1-B               | same as A7               |            |                |              |             |               |            |          | Δ vs A7        |
 | B5     | DLC + CCD-OR | Best Video + Best Forensic | late fusion α=           |          — |                |              |             |               |          — |        — | Fusion         |
+
+
+| Fusion | Video | Forensic | α(Video) | Threshold | Val Macro-F1 | Δ vs Best Single | Prediction Corr |
+| ------ | ----- | -------- | -------: | --------: | -----------: | ---------------: | --------------: |
+| FUS-A1 |       |          |          |           |              |                  |                 |
+| FUS-A2 |       |          |          |           |              |                  |                 |
+| FUS-B1 |       |          |          |           |              |                  |                 |
