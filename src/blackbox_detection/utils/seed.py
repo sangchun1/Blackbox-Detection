@@ -82,27 +82,20 @@ def seed_everything(
 def seed_worker(worker_id: int) -> None:
     """Seed every DataLoader worker deterministically.
 
-    PyTorch assigns each worker a deterministic ``torch.initial_seed()`` based
-    on the DataLoader's generator and the worker id. We reuse that value to
-    seed Python, NumPy, PyTorch, and OpenCV inside the worker process.
-
-    PyTorch/NumPy can consume an unsigned 32-bit seed, but OpenCV's Python
-    binding expects a signed C int. Convert the same 32-bit bit pattern to
-    signed int32 before passing it to cv2.setRNGSeed().
+    Keep the worker seed inside signed 32-bit range because NumPy/OpenCV
+    bindings in some Colab environments reject larger integer seeds.
     """
-    del worker_id
+    del worker_id  # worker id is already encoded in torch.initial_seed()
 
-    worker_seed = torch.initial_seed() % (2**32)
+    # 0 ~ 2^31-1: safe for Python, NumPy, PyTorch, and OpenCV.
+    worker_seed = int(torch.initial_seed() & 0x7FFFFFFF)
 
     random.seed(worker_seed)
     np.random.seed(worker_seed)
     torch.manual_seed(worker_seed)
 
     if cv2 is not None:
-        cv2_seed = int(worker_seed)
-        if cv2_seed >= 2**31:
-            cv2_seed -= 2**32
-        cv2.setRNGSeed(cv2_seed)
+        cv2.setRNGSeed(worker_seed)
 
 
 def make_generator(seed: int = DEFAULT_SEED) -> torch.Generator:
