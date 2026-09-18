@@ -79,6 +79,7 @@ outputs/*
 !outputs/README.md
 
 wandb/
+submissions/
 
 # =============================================================================
 # Model weights / checkpoints
@@ -89,6 +90,7 @@ wandb/
 *.ckpt
 *.safetensors
 *.onnx
+*.ts
 
 # Hugging Face / model caches when placed inside the repository
 .huggingface/
@@ -109,3 +111,4 @@ hf_cache/
 *.tmp
 *.temp
 tempCodeRunnerFile.py
+result.md
