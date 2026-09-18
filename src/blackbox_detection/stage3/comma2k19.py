@@ -49,9 +49,7 @@ class PrepareConfig:
 
 
 def find_archives(raw_root: str | Path) -> list[Path]:
-    root = Path(raw_root)
-    archives = sorted(root.rglob("*.zip"))
-    return archives
+    return sorted(Path(raw_root).rglob("*.zip"))
 
 
 def _route_and_segment(parts: tuple[str, ...]) -> tuple[str, str]:
@@ -61,13 +59,14 @@ def _route_and_segment(parts: tuple[str, ...]) -> tuple[str, str]:
             route_idx = i
             break
     if route_idx is None:
-        # Fallback for archives whose route names were sanitized.
         for i, part in enumerate(parts):
             if "--" in part and i + 1 < len(parts):
                 route_idx = i
                 break
     if route_idx is None or route_idx + 1 >= len(parts):
-        raise ValueError(f"cannot parse route/segment from archive path: {'/'.join(parts)}")
+        raise ValueError(
+            f"cannot parse route/segment from archive path: {'/'.join(parts)}"
+        )
     return parts[route_idx], parts[route_idx + 1]
 
 
@@ -89,25 +88,39 @@ def discover_segments(archive: str | Path) -> list[SegmentRef]:
                     video_member=name,
                 )
             )
-    refs.sort(key=lambda r: (r.route_id, int(r.segment_id) if r.segment_id.isdigit() else r.segment_id))
+    refs.sort(
+        key=lambda r: (
+            r.route_id,
+            int(r.segment_id) if r.segment_id.isdigit() else r.segment_id,
+        )
+    )
     return refs
 
 
-def _match_member(names: list[str], prefix: str, tokens: tuple[str, ...], basenames: tuple[str, ...]) -> str | None:
+def _match_member(
+    names: list[str],
+    prefix: str,
+    tokens: tuple[str, ...],
+    basenames: tuple[str, ...],
+) -> str | None:
     prefix_lower = prefix.lower().rstrip("/") + "/"
     candidates = []
+
     for name in names:
         low = name.lower()
         if not low.startswith(prefix_lower):
             continue
         if not all(tok.lower() in low for tok in tokens):
             continue
+
         base = PurePosixPath(low).name
         stem = PurePosixPath(base).stem
         if base in basenames or stem in basenames:
             candidates.append(name)
+
     if not candidates:
         return None
+
     candidates.sort(key=len)
     return candidates[0]
 
@@ -119,14 +132,25 @@ def _load_npy(zf: zipfile.ZipFile, member: str | None):
 
 
 def _load_pair(zf, names, prefix, group_tokens):
-    t_member = _match_member(names, prefix, group_tokens, ("t", "time", "times", "timestamp", "timestamps"))
-    v_member = _match_member(names, prefix, group_tokens, ("value", "values", "v"))
+    t_member = _match_member(
+        names,
+        prefix,
+        group_tokens,
+        ("t", "time", "times", "timestamp", "timestamps"),
+    )
+    v_member = _match_member(
+        names,
+        prefix,
+        group_tokens,
+        ("value", "values", "v"),
+    )
     if t_member is None or v_member is None:
         return None, None
     return _load_npy(zf, t_member), _load_npy(zf, v_member)
 
+
 def _load_pair_any(zf, names, prefix, token_options):
-    """Try multiple path aliases and return the first valid (t, value) pair."""
+    """Try multiple archive path aliases and return the first valid pair."""
     for tokens in token_options:
         t, v = _load_pair(zf, names, prefix, tokens)
         if t is not None and v is not None:
@@ -141,13 +165,22 @@ def _load_global(zf, names, prefix, basename):
     )
 
 
-def load_segment_signals(zf: zipfile.ZipFile, ref: SegmentRef) -> dict[str, np.ndarray | None]:
+def load_segment_signals(
+    zf: zipfile.ZipFile,
+    ref: SegmentRef,
+) -> dict[str, np.ndarray | None]:
     names = zf.namelist()
+
     frame_times = _load_global(zf, names, ref.prefix, "frame_times")
     if frame_times is None:
         raise FileNotFoundError(f"frame_times not found for {ref.prefix}")
 
-    frame_velocities = _load_global(zf, names, ref.prefix, "frame_velocities")
+    frame_velocities = _load_global(
+        zf, names, ref.prefix, "frame_velocities"
+    )
+
+    # Actual Academic Torrents archive currently uses CAN/speed and
+    # IMU/accelerometer. Keep documented/legacy aliases as fallbacks.
     speed_t, speed_v = _load_pair_any(
         zf,
         names,
@@ -188,11 +221,16 @@ def load_segment_signals(zf: zipfile.ZipFile, ref: SegmentRef) -> dict[str, np.n
     )
 
     if speed_t is None or steer_t is None:
-        raise FileNotFoundError(f"required CAN speed/steering signals missing in {ref.prefix}")
+        raise FileNotFoundError(
+            f"required CAN speed/steering signals missing in {ref.prefix}"
+        )
 
     return {
         "frame_times": np.asarray(frame_times),
-        "frame_velocities": None if frame_velocities is None else np.asarray(frame_velocities),
+        "frame_velocities": (
+            None if frame_velocities is None
+            else np.asarray(frame_velocities)
+        ),
         "speed_t": speed_t,
         "speed_v": speed_v,
         "steer_t": steer_t,
@@ -204,88 +242,187 @@ def load_segment_signals(zf: zipfile.ZipFile, ref: SegmentRef) -> dict[str, np.n
     }
 
 
-def build_frame_table(ref: SegmentRef, signals: dict, video_relpath: str) -> pd.DataFrame:
-    frame_times = np.asarray(signals["frame_times"], dtype=np.float64).reshape(-1)
-    source_indices = np.arange(0, len(frame_times), 2, dtype=np.int64)
+def build_frame_table(
+    ref: SegmentRef,
+    signals: dict,
+    video_relpath: str,
+) -> pd.DataFrame:
+    frame_times = np.asarray(
+        signals["frame_times"],
+        dtype=np.float64,
+    ).reshape(-1)
+
+    source_indices = np.arange(
+        0,
+        len(frame_times),
+        2,
+        dtype=np.int64,
+    )
     q = frame_times[source_indices]
 
-    speed_all, valid_speed_all = interpolate_signal(frame_times, signals["speed_t"], signals["speed_v"])
-    steer_all, valid_steer_all = interpolate_signal(frame_times, signals["steer_t"], signals["steer_v"])
+    speed_all, valid_speed_all = interpolate_signal(
+        frame_times,
+        signals["speed_t"],
+        signals["speed_v"],
+    )
+    steer_all, valid_steer_all = interpolate_signal(
+        frame_times,
+        signals["steer_t"],
+        signals["steer_v"],
+    )
+
     speed = np.asarray(speed_all).reshape(-1)[source_indices]
     steering = np.asarray(steer_all).reshape(-1)[source_indices]
-    valid_speed = valid_speed_all[source_indices] & np.isfinite(speed)
-    valid_steer = valid_steer_all[source_indices] & np.isfinite(steering)
 
-    accel_from_speed, speed_smoothed = acceleration_from_speed(speed, q, smooth_window=11)
+    valid_speed = (
+        valid_speed_all[source_indices]
+        & np.isfinite(speed)
+    )
+    valid_steer = (
+        valid_steer_all[source_indices]
+        & np.isfinite(steering)
+    )
+
+    accel_from_speed, speed_smoothed = acceleration_from_speed(
+        speed,
+        q,
+        smooth_window=11,
+    )
+
     valid_accel_from_speed = valid_speed.copy()
     if len(valid_accel_from_speed) > 0:
         valid_accel_from_speed[[0, -1]] = False
+
     steering_rate = derivative(steering, q)
 
     accel_imu = np.full(len(q), np.nan, dtype=np.float64)
     valid_accel_imu = np.zeros(len(q), dtype=bool)
-    if signals["accel_t"] is not None and signals["accel_v"] is not None:
-        a_all, a_valid_all = interpolate_signal(frame_times, signals["accel_t"], signals["accel_v"])
+
+    if (
+        signals["accel_t"] is not None
+        and signals["accel_v"] is not None
+    ):
+        a_all, a_valid_all = interpolate_signal(
+            frame_times,
+            signals["accel_t"],
+            signals["accel_v"],
+        )
         a_all = np.asarray(a_all)
+
+        # comma2k19 IMU order: [forward, right, down]
         if a_all.ndim > 1:
             a_all = a_all[:, 0]
+
         accel_imu = a_all[source_indices]
-        valid_accel_imu = a_valid_all[source_indices] & np.isfinite(accel_imu)
+        valid_accel_imu = (
+            a_valid_all[source_indices]
+            & np.isfinite(accel_imu)
+        )
 
     yaw = np.full(len(q), np.nan, dtype=np.float64)
     valid_yaw = np.zeros(len(q), dtype=bool)
-    if signals["gyro_t"] is not None and signals["gyro_v"] is not None:
-        g_all, g_valid_all = interpolate_signal(frame_times, signals["gyro_t"], signals["gyro_v"])
+
+    if (
+        signals["gyro_t"] is not None
+        and signals["gyro_v"] is not None
+    ):
+        g_all, g_valid_all = interpolate_signal(
+            frame_times,
+            signals["gyro_t"],
+            signals["gyro_v"],
+        )
         g_all = np.asarray(g_all)
+
+        # [forward, right, down] -> yaw about down axis
         if g_all.ndim > 1 and g_all.shape[1] >= 3:
-            g_all = g_all[:, 2]  # [forward, right, down] -> yaw around down axis
+            g_all = g_all[:, 2]
         elif g_all.ndim > 1:
             g_all = g_all[:, -1]
+
         yaw = g_all[source_indices]
-        valid_yaw = g_valid_all[source_indices] & np.isfinite(yaw)
+        valid_yaw = (
+            g_valid_all[source_indices]
+            & np.isfinite(yaw)
+        )
 
     pose_speed = np.full(len(q), np.nan, dtype=np.float64)
     frame_velocities = signals.get("frame_velocities")
+
     if frame_velocities is not None:
         fv = np.asarray(frame_velocities, dtype=np.float64)
-        if fv.ndim == 2 and fv.shape[0] >= len(frame_times) and fv.shape[1] >= 3:
-            pose_speed = np.linalg.norm(fv[: len(frame_times), :3], axis=1)[source_indices]
+        if (
+            fv.ndim == 2
+            and fv.shape[0] >= len(frame_times)
+            and fv.shape[1] >= 3
+        ):
+            pose_speed = np.linalg.norm(
+                fv[: len(frame_times), :3],
+                axis=1,
+            )[source_indices]
 
-    df = pd.DataFrame({
-        "dataset": "comma2k19",
-        "vehicle_id": ref.vehicle_id,
-        "route_id": ref.route_id,
-        "segment_id": ref.segment_id,
-        "frame_index_10hz": np.arange(len(q), dtype=np.int32),
-        "frame_index_source": source_indices.astype(np.int32),
-        "timestamp": q,
-        "speed_mps": speed_smoothed.astype(np.float32),
-        "speed_pose_mps": pose_speed.astype(np.float32),
-        "accel_from_speed_mps2": accel_from_speed.astype(np.float32),
-        "accel_imu_forward_mps2": accel_imu.astype(np.float32),
-        "steering_deg": steering.astype(np.float32),
-        "steering_rate_dps": steering_rate.astype(np.float32),
-        "yaw_rate_rps": yaw.astype(np.float32),
-        "valid_speed": valid_speed,
-        "valid_accel_from_speed": valid_accel_from_speed,
-        "valid_accel_imu": valid_accel_imu,
-        "valid_steer": valid_steer,
-        "valid_yaw": valid_yaw,
-        "video_relpath": video_relpath,
-    })
-    return df
+    return pd.DataFrame(
+        {
+            "dataset": "comma2k19",
+            "vehicle_id": ref.vehicle_id,
+            "route_id": ref.route_id,
+            "segment_id": ref.segment_id,
+            "frame_index_10hz": np.arange(
+                len(q),
+                dtype=np.int32,
+            ),
+            "frame_index_source": source_indices.astype(np.int32),
+            "timestamp": q,
+            "speed_mps": speed_smoothed.astype(np.float32),
+            "speed_pose_mps": pose_speed.astype(np.float32),
+            "accel_from_speed_mps2": accel_from_speed.astype(np.float32),
+            "accel_imu_forward_mps2": accel_imu.astype(np.float32),
+            "steering_deg": steering.astype(np.float32),
+            "steering_rate_dps": steering_rate.astype(np.float32),
+            "yaw_rate_rps": yaw.astype(np.float32),
+            "valid_speed": valid_speed,
+            "valid_accel_from_speed": valid_accel_from_speed,
+            "valid_accel_imu": valid_accel_imu,
+            "valid_steer": valid_steer,
+            "valid_yaw": valid_yaw,
+            "video_relpath": video_relpath,
+        }
+    )
 
 
-def prepare_segment(zf: zipfile.ZipFile, ref: SegmentRef, cfg: PrepareConfig) -> dict:
+def prepare_segment(
+    zf: zipfile.ZipFile,
+    ref: SegmentRef,
+    cfg: PrepareConfig,
+) -> dict:
     processed_root = Path(cfg.processed_root)
     route = ref.safe_route_id
-    video_out = processed_root / "videos" / route / f"{ref.segment_id}.mp4"
-    meta_out = processed_root / "metadata" / route / f"{ref.segment_id}.npz"
+
+    video_out = (
+        processed_root
+        / "videos"
+        / route
+        / f"{ref.segment_id}.mp4"
+    )
+    meta_out = (
+        processed_root
+        / "metadata"
+        / route
+        / f"{ref.segment_id}.npz"
+    )
+
     video_relpath = video_out.relative_to(processed_root).as_posix()
     meta_relpath = meta_out.relative_to(processed_root).as_posix()
 
     if video_out.exists() and meta_out.exists() and not cfg.overwrite:
-        df = read_frame_table(meta_out, columns=["route_id", "segment_id", "vehicle_id", "timestamp"])
+        df = read_frame_table(
+            meta_out,
+            columns=[
+                "route_id",
+                "segment_id",
+                "vehicle_id",
+                "timestamp",
+            ],
+        )
         return {
             "dataset": "comma2k19",
             "archive": ref.archive.name,
@@ -293,16 +430,34 @@ def prepare_segment(zf: zipfile.ZipFile, ref: SegmentRef, cfg: PrepareConfig) ->
             "route_id": str(df.iloc[0]["route_id"]),
             "segment_id": str(df.iloc[0]["segment_id"]),
             "num_frames": len(df),
-            "duration_s": float(df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]) if len(df) > 1 else 0.0,
+            "duration_s": (
+                float(
+                    df["timestamp"].iloc[-1]
+                    - df["timestamp"].iloc[0]
+                )
+                if len(df) > 1 else 0.0
+            ),
             "video_relpath": video_relpath,
             "metadata_relpath": meta_relpath,
         }
 
     signals = load_segment_signals(zf, ref)
-    with tempfile.TemporaryDirectory(prefix="comma2k19_") as tmp:
+
+    with tempfile.TemporaryDirectory(
+        prefix="comma2k19_"
+    ) as tmp:
         tmp_hevc = Path(tmp) / "video.hevc"
-        with zf.open(ref.video_member) as src, open(tmp_hevc, "wb") as dst:
-            shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+
+        with zf.open(ref.video_member) as src, open(
+            tmp_hevc,
+            "wb",
+        ) as dst:
+            shutil.copyfileobj(
+                src,
+                dst,
+                length=8 * 1024 * 1024,
+            )
+
         transcode_every_other_frame(
             tmp_hevc,
             video_out,
@@ -313,8 +468,13 @@ def prepare_segment(zf: zipfile.ZipFile, ref: SegmentRef, cfg: PrepareConfig) ->
             crf=cfg.crf,
         )
 
-    df = build_frame_table(ref, signals, video_relpath)
+    df = build_frame_table(
+        ref,
+        signals,
+        video_relpath,
+    )
     write_frame_table(df, meta_out)
+
     return {
         "dataset": "comma2k19",
         "archive": ref.archive.name,
@@ -322,7 +482,13 @@ def prepare_segment(zf: zipfile.ZipFile, ref: SegmentRef, cfg: PrepareConfig) ->
         "route_id": ref.route_id,
         "segment_id": ref.segment_id,
         "num_frames": len(df),
-        "duration_s": float(df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]) if len(df) > 1 else 0.0,
+        "duration_s": (
+            float(
+                df["timestamp"].iloc[-1]
+                - df["timestamp"].iloc[0]
+            )
+            if len(df) > 1 else 0.0
+        ),
         "video_relpath": video_relpath,
         "metadata_relpath": meta_relpath,
     }
@@ -337,21 +503,33 @@ def prepare_archive(
 ) -> pd.DataFrame:
     archive = Path(archive)
     refs = discover_segments(archive)
+
     if max_segments is not None:
         refs = refs[:max_segments]
+
     rows = []
+
     with zipfile.ZipFile(archive) as zf:
-        iterator = tqdm(refs, desc=archive.name) if show_progress else refs
+        iterator = (
+            tqdm(refs, desc=archive.name)
+            if show_progress else refs
+        )
+
         for ref in iterator:
             try:
-                rows.append(prepare_segment(zf, ref, cfg))
+                rows.append(
+                    prepare_segment(zf, ref, cfg)
+                )
             except Exception as exc:
-                rows.append({
-                    "dataset": "comma2k19",
-                    "archive": archive.name,
-                    "vehicle_id": ref.vehicle_id,
-                    "route_id": ref.route_id,
-                    "segment_id": ref.segment_id,
-                    "error": repr(exc),
-                })
+                rows.append(
+                    {
+                        "dataset": "comma2k19",
+                        "archive": archive.name,
+                        "vehicle_id": ref.vehicle_id,
+                        "route_id": ref.route_id,
+                        "segment_id": ref.segment_id,
+                        "error": repr(exc),
+                    }
+                )
+
     return pd.DataFrame(rows)
