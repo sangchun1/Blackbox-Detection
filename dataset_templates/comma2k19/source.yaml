@@ -1,0 +1,14 @@
+name: comma2k19
+provider: comma.ai
+homepage: https://github.com/commaai/comma2k19
+license: MIT
+stage3_usage:
+  video: true
+  speed: true
+  steering: true
+  imu: true
+preprocessing:
+  source_fps: 20
+  target_fps: 10
+  stored_resolution: [512, 384]
+  source_frame_selection: every_other_frame_starting_at_0

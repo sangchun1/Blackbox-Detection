@@ -1,0 +1,35 @@
+seed: 20260918
+
+data:
+  clip_len: 16
+  window_stride: 16
+  input_height: 288
+  input_width: 384
+  num_workers: 2
+  train_random_flip: true
+  max_train_windows: 12000
+  max_val_windows: 4000
+
+model:
+  backbone: vjepa2_1_vit_base_384
+  out_layers: [2, 5, 8, 11]
+  freeze_backbone: true
+  temporal_hidden: 256
+  temporal_layers: 2
+  feature_dim: 384
+
+training:
+  epochs: 4
+  batch_size: 2
+  grad_accum_steps: 4
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  amp_dtype: bf16
+  max_steps_per_epoch: 2000
+
+loss:
+  speed_mps: 1.0
+  accel_from_speed_mps2: 1.5
+  steering_deg: 1.5
+  yaw_rate_rps: 0.75

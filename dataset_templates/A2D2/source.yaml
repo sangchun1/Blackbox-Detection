@@ -1,0 +1,11 @@
+name: A2D2
+provider: Audi
+license: CC BY-ND 4.0
+stage3_usage:
+  front_center_camera: true
+  vehicle_bus: true
+  lidar: false
+  other_cameras: false
+notes:
+  - Keep original download/source records for competition verification.
+  - Do not redistribute transformed A2D2 data without checking the ND license condition.

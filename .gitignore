@@ -89,6 +89,7 @@ wandb/
 *.ckpt
 *.safetensors
 *.onnx
+submissions/
 
 # Hugging Face / model caches when placed inside the repository
 .huggingface/
