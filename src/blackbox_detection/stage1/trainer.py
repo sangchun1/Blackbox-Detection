@@ -365,7 +365,7 @@ class Stage1Trainer:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=self.scaler,
-                map_location=self.device,
+                map_location="cpu",
             )
             start_epoch = int(metadata.get("epoch") or 0) + 1
             best_score = float(metadata.get("best_score") or -math.inf)
