@@ -125,6 +125,14 @@ def _load_pair(zf, names, prefix, group_tokens):
         return None, None
     return _load_npy(zf, t_member), _load_npy(zf, v_member)
 
+def _load_pair_any(zf, names, prefix, token_options):
+    """Try multiple path aliases and return the first valid (t, value) pair."""
+    for tokens in token_options:
+        t, v = _load_pair(zf, names, prefix, tokens)
+        if t is not None and v is not None:
+            return t, v
+    return None, None
+
 
 def _load_global(zf, names, prefix, basename):
     return _load_npy(
@@ -140,12 +148,44 @@ def load_segment_signals(zf: zipfile.ZipFile, ref: SegmentRef) -> dict[str, np.n
         raise FileNotFoundError(f"frame_times not found for {ref.prefix}")
 
     frame_velocities = _load_global(zf, names, ref.prefix, "frame_velocities")
-    speed_t, speed_v = _load_pair(zf, names, ref.prefix, ("processed_log", "car_speed"))
-    steer_t, steer_v = _load_pair(zf, names, ref.prefix, ("processed_log", "steering_angle"))
-    accel_t, accel_v = _load_pair(zf, names, ref.prefix, ("processed_log", "imu", "acceleration"))
-    gyro_t, gyro_v = _load_pair(zf, names, ref.prefix, ("processed_log", "imu", "gyro"))
-    if gyro_t is None:
-        gyro_t, gyro_v = _load_pair(zf, names, ref.prefix, ("processed_log", "imu", "gyro_uncalibrated"))
+    speed_t, speed_v = _load_pair_any(
+        zf,
+        names,
+        ref.prefix,
+        [
+            ("processed_log", "/can/speed/"),
+            ("processed_log", "/can/car_speed/"),
+        ],
+    )
+
+    steer_t, steer_v = _load_pair_any(
+        zf,
+        names,
+        ref.prefix,
+        [
+            ("processed_log", "/can/steering_angle/"),
+        ],
+    )
+
+    accel_t, accel_v = _load_pair_any(
+        zf,
+        names,
+        ref.prefix,
+        [
+            ("processed_log", "/imu/accelerometer/"),
+            ("processed_log", "/imu/acceleration/"),
+        ],
+    )
+
+    gyro_t, gyro_v = _load_pair_any(
+        zf,
+        names,
+        ref.prefix,
+        [
+            ("processed_log", "/imu/gyro/"),
+            ("processed_log", "/imu/gyro_uncalibrated/"),
+        ],
+    )
 
     if speed_t is None or steer_t is None:
         raise FileNotFoundError(f"required CAN speed/steering signals missing in {ref.prefix}")
