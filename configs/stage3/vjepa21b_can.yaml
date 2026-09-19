@@ -42,6 +42,26 @@ loss:
   steering_deg: 1.5
   yaw_rate_rps: 0.75
 
+# Diagnostic only. These are NOT DACON's hidden labeling thresholds.
+# They convert continuous comma2k19 CAN targets/predictions into several
+# Stage-3-like proxy labelings, then score those labels with the locked
+# DACON Macro-F1 semantics from metrics.py.
+validation:
+  backfill_on_resume: true
+  proxy_rules:
+    sensitive:
+      stop_speed_mps: 0.30
+      accel_deadzone_mps2: 0.10
+      steer_deadzone_deg: 2.0
+    medium:
+      stop_speed_mps: 0.50
+      accel_deadzone_mps2: 0.20
+      steer_deadzone_deg: 5.0
+    conservative:
+      stop_speed_mps: 1.00
+      accel_deadzone_mps2: 0.30
+      steer_deadzone_deg: 8.0
+
 logging:
   wandb_enabled: true
   wandb_project: blackbox-stage3

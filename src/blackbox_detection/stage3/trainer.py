@@ -18,7 +18,7 @@ from torch import nn
 from ..utils.checkpoint import load_checkpoint, save_checkpoint
 from ..utils.logging import create_progress_bar, log_metrics, setup_logger
 from .losses import can_multitask_loss
-from .metrics import regression_metrics
+from .proxy_metrics import Stage3ValidationAccumulator
 
 HISTORY_FILENAME = "history.csv"
 CONFIG_FILENAME = "train_config.json"
@@ -151,6 +151,7 @@ class CANTrainer:
         amp_dtype: str = "bf16",
         loss_weights: Mapping[str, float] | None = None,
         stats: Mapping[str, Any] | None = None,
+        proxy_rules: Mapping[str, Mapping[str, float]] | None = None,
         output_dir: str | Path | None = None,
         sync_dir: str | Path | None = None,
         wandb_enabled: bool = False,
@@ -167,6 +168,10 @@ class CANTrainer:
         self.amp_dtype = _amp_dtype(amp_dtype)
         self.loss_weights = dict(loss_weights or {})
         self.stats = dict(stats or {})
+        self.proxy_rules = {
+            str(name): dict(rule)
+            for name, rule in dict(proxy_rules or {}).items()
+        }
         self.wandb_enabled = bool(wandb_enabled)
         self.log_interval = max(1, int(log_interval))
         self.config = dict(config or {})
@@ -335,7 +340,6 @@ class CANTrainer:
         )
 
         for step, batch in enumerate(progress):
-
             video, target, valid = self._move(batch)
             with torch.autocast(
                 device_type=self.device.type,
@@ -353,23 +357,51 @@ class CANTrainer:
 
             scaled_loss.backward()
             micro_steps += 1
+            optimizer_stepped = False
 
             if micro_steps % self.grad_accum_steps == 0:
                 self._optimizer_step()
+                optimizer_stepped = True
 
             logs.append(parts)
             running_loss += float(parts["total"])
+            running_avg = running_loss / micro_steps
 
-            if (
+            should_report = (
                 step == 0
                 or (step + 1) % self.log_interval == 0
                 or step + 1 == total_steps
-            ):
+            )
+            if should_report:
                 progress.set_postfix(
                     loss=f"{parts['total']:.4f}",
-                    avg=f"{running_loss / micro_steps:.4f}",
+                    avg=f"{running_avg:.4f}",
                     lr=f"{self.optimizer.param_groups[0]['lr']:.2e}",
                 )
+
+            # Dense W&B curves use optimizer/global step, not epoch number.
+            # This keeps W&B's x-axis monotonic across Colab resume.
+            if (
+                self.wandb_enabled
+                and optimizer_stepped
+                and (
+                    (step + 1) % self.log_interval == 0
+                    or step + 1 == total_steps
+                )
+            ):
+                payload: dict[str, Any] = {
+                    "epoch": int(epoch) if epoch is not None else 0,
+                    "train_step/total": float(parts["total"]),
+                    "train_step/running_total": float(running_avg),
+                    "optim/learning_rate": float(
+                        self.optimizer.param_groups[0]["lr"]
+                    ),
+                    "system/global_step": int(self.global_step),
+                }
+                for key, value in parts.items():
+                    if key != "total":
+                        payload[f"train_step/{key}"] = float(value)
+                log_metrics(payload, step=self.global_step)
 
         progress.close()
 
@@ -387,9 +419,16 @@ class CANTrainer:
         epoch: int | None = None,
     ) -> dict[str, float]:
         self.model.eval()
-        logs: list[dict[str, float]] = []
+        loss_logs: list[dict[str, float]] = []
         running_loss = 0.0
         num_steps = 0
+
+        # Dataset-level accumulator fixes the old mean-of-batch-RMSE issue and
+        # also computes *proxy* class diagnostics without touching metrics.py.
+        diagnostics = Stage3ValidationAccumulator(
+            self.stats,
+            proxy_rules=self.proxy_rules,
+        )
 
         total_steps = len(loader)
         if max_steps is not None:
@@ -405,7 +444,6 @@ class CANTrainer:
         )
 
         for step, batch in enumerate(progress):
-
             video, target, valid = self._move(batch)
             with torch.autocast(
                 device_type=self.device.type,
@@ -420,8 +458,8 @@ class CANTrainer:
                     self.loss_weights,
                 )
 
-            metrics = regression_metrics(out, target, valid, self.stats)
-            logs.append({**loss_parts, **metrics})
+            diagnostics.update(out, target, valid)
+            loss_logs.append(loss_parts)
             num_steps += 1
             running_loss += float(loss_parts["total"])
 
@@ -430,13 +468,17 @@ class CANTrainer:
                 or (step + 1) % self.log_interval == 0
                 or step + 1 == total_steps
             ):
-                progress.set_postfix(
-                    loss=f"{loss_parts['total']:.4f}",
-                    avg=f"{running_loss / num_steps:.4f}",
-                )
+                postfix = {
+                    "loss": f"{loss_parts['total']:.4f}",
+                    "avg": f"{running_loss / num_steps:.4f}",
+                }
+                progress.set_postfix(**postfix)
 
         progress.close()
-        return _mean_dict(logs)
+
+        result = _mean_dict(loss_logs)
+        result.update(diagnostics.compute())
+        return result
 
     def fit(
         self,
@@ -448,6 +490,7 @@ class CANTrainer:
         max_val_steps: int | None = None,
         resume_from: str | Path | None = None,
         early_stopping_patience: int = 0,
+        backfill_validation_on_resume: bool = True,
     ) -> list[dict[str, Any]]:
         start_epoch = 1
         best = float("inf")
@@ -521,6 +564,41 @@ class CANTrainer:
                 self.global_step,
             )
 
+            # Patch-v5 can resume an epoch-1 checkpoint produced before proxy
+            # diagnostics existed. Re-run validation once so that epoch 1 also
+            # receives exact dataset-level regression metrics + proxy F1.
+            last_val = dict(history[-1].get("val") or {}) if history else {}
+            needs_backfill = (
+                bool(backfill_validation_on_resume)
+                and bool(history)
+                and self.proxy_rules
+                and not any(key.startswith("proxy/") for key in last_val)
+            )
+            if needs_backfill:
+                completed_epoch = start_epoch - 1
+                self.logger.info(
+                    "Backfilling validation diagnostics for resumed epoch %d...",
+                    completed_epoch,
+                )
+                backfilled = self.evaluate(
+                    val_loader,
+                    max_val_steps,
+                    epoch=completed_epoch,
+                )
+                history[-1]["val"] = backfilled
+                self._save_history(history)
+
+                if self.wandb_enabled:
+                    payload: dict[str, Any] = {
+                        "epoch": completed_epoch,
+                        "event/resume_validation_backfill": 1,
+                        "system/global_step": self.global_step,
+                    }
+                    payload.update(
+                        {f"val/{key}": value for key, value in backfilled.items()}
+                    )
+                    log_metrics(payload, step=self.global_step)
+
         if start_epoch > int(epochs):
             self.logger.info(
                 "Checkpoint already completed epoch %d; configured epochs=%d.",
@@ -580,16 +658,21 @@ class CANTrainer:
             )
             self._save_history(history)
 
+            proxy_mean = float(
+                val.get("proxy/robust_mean_stage3_score", float("nan"))
+            )
             self.logger.info(
-                "Epoch %d/%d | train %.6f | val %.6f | lr %.3e | %.1f min | peak %.2f GiB%s",
+                "Epoch %d/%d | train %.6f | val %.6f | proxy-F1(mean) %.4f | "
+                "lr %.3e | %.1f min | peak %.2f GiB%s",
                 epoch,
                 epochs,
                 float(train.get("total", float("nan"))),
                 score,
+                proxy_mean,
                 learning_rate,
                 minutes,
                 max_gpu_memory_gib,
-                " <- best" if improved else "",
+                " <- best CAN-pretrain" if improved else "",
             )
 
             if self.wandb_enabled:
@@ -599,11 +682,13 @@ class CANTrainer:
                     "system/epoch_minutes": minutes,
                     "system/max_gpu_memory_gib": max_gpu_memory_gib,
                     "system/global_step": self.global_step,
-                    "val/best_total": best,
+                    "selection/best_val_total": best,
                 }
                 payload.update({f"train/{k}": v for k, v in train.items()})
                 payload.update({f"val/{k}": v for k, v in val.items()})
-                log_metrics(payload, step=epoch)
+                # Use global optimizer step everywhere. Epoch itself is logged
+                # as a metric, avoiding W&B step resets after dense train logs.
+                log_metrics(payload, step=self.global_step)
 
             if (
                 int(early_stopping_patience) > 0
