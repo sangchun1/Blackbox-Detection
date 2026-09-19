@@ -1,5 +1,8 @@
 seed: 20260918
 
+experiment:
+  name: vjepa21b_can_v1
+
 data:
   clip_len: 16
   window_stride: 16
@@ -24,12 +27,22 @@ training:
   grad_accum_steps: 4
   learning_rate: 0.0002
   weight_decay: 0.01
+  warmup_ratio: 0.10
+  min_learning_rate_ratio: 0.01
   grad_clip_norm: 1.0
   amp_dtype: bf16
   max_steps_per_epoch: 2000
+  max_val_steps: 500
+  early_stopping_patience: 0
+  log_interval: 20
 
 loss:
   speed_mps: 1.0
   accel_from_speed_mps2: 1.5
   steering_deg: 1.5
   yaw_rate_rps: 0.75
+
+logging:
+  wandb_enabled: true
+  wandb_project: blackbox-stage3
+  wandb_group: vjepa21b_can
