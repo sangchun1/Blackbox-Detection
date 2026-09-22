@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, roc_auc_score
 
 from .constants import CAN_TARGETS
 from .metrics import (
@@ -186,6 +186,130 @@ def _accel_shape_diagnostics(
     }
 
 
+def _safe_binary_auc(target: np.ndarray, score: np.ndarray) -> float:
+    target = np.asarray(target, dtype=np.int64)
+    score = np.asarray(score, dtype=np.float64)
+    if target.size == 0 or np.unique(target).size < 2:
+        return float("nan")
+    return float(roc_auc_score(target, score))
+
+
+def _ordinal_aux_diagnostics(
+    truth_accel_mps2: np.ndarray,
+    logits: np.ndarray,
+    thresholds_mps2: np.ndarray,
+) -> dict[str, float]:
+    """Diagnostic quality of the training-only acceleration ordinal head.
+
+    These are NOT DACON metrics. They answer a narrower question: can the shared
+    frozen-backbone temporal representation linearly separate positive and
+    negative acceleration events at several continuous-CAN magnitude levels?
+    """
+    truth = np.asarray(truth_accel_mps2, dtype=np.float64).reshape(-1)
+    logits = np.asarray(logits, dtype=np.float64)
+    thresholds = np.asarray(thresholds_mps2, dtype=np.float64).reshape(-1)
+
+    if logits.ndim != 3 or logits.shape[-1] != 2:
+        raise ValueError(
+            "ordinal diagnostic logits must have shape [N, K, 2], got "
+            f"{logits.shape}"
+        )
+    if logits.shape[0] != truth.shape[0] or logits.shape[1] != len(thresholds):
+        raise ValueError(
+            "ordinal diagnostic shape mismatch: "
+            f"truth={truth.shape}, logits={logits.shape}, thresholds={thresholds.shape}"
+        )
+
+    result: dict[str, float] = {}
+    accel_aucs: list[float] = []
+    decel_aucs: list[float] = []
+    accel_f1s: list[float] = []
+    decel_f1s: list[float] = []
+    three_state_f1s: list[float] = []
+
+    for k, threshold in enumerate(thresholds):
+        tag = f"{float(threshold):.2f}".replace(".", "p")
+        decel_truth = truth < -float(threshold)
+        accel_truth = truth > float(threshold)
+
+        decel_score = logits[:, k, 0]
+        accel_score = logits[:, k, 1]
+        decel_pred = decel_score > 0.0
+        accel_pred = accel_score > 0.0
+
+        decel_f1 = float(
+            f1_score(decel_truth, decel_pred, average="binary", zero_division=0)
+        )
+        accel_f1 = float(
+            f1_score(accel_truth, accel_pred, average="binary", zero_division=0)
+        )
+        decel_auc = _safe_binary_auc(decel_truth, decel_score)
+        accel_auc = _safe_binary_auc(accel_truth, accel_score)
+
+        result[f"aux/ordinal/decel_f1_thr_{tag}"] = decel_f1
+        result[f"aux/ordinal/accel_f1_thr_{tag}"] = accel_f1
+        result[f"aux/ordinal/decel_auc_thr_{tag}"] = decel_auc
+        result[f"aux/ordinal/accel_auc_thr_{tag}"] = accel_auc
+        result[f"aux/ordinal/decel_positive_fraction_thr_{tag}"] = float(
+            decel_truth.mean()
+        )
+        result[f"aux/ordinal/accel_positive_fraction_thr_{tag}"] = float(
+            accel_truth.mean()
+        )
+
+        # A three-state diagnostic using only this auxiliary threshold pair.
+        # If both directions fire, select the larger logit. Otherwise the frame
+        # is CONSTANT. This is intentionally separate from DACON proxy scoring.
+        truth_state = np.full(truth.shape, 1, dtype=np.int64)  # constant
+        truth_state[decel_truth] = 0
+        truth_state[accel_truth] = 2
+
+        pred_state = np.full(truth.shape, 1, dtype=np.int64)
+        only_decel = decel_pred & ~accel_pred
+        only_accel = accel_pred & ~decel_pred
+        both = decel_pred & accel_pred
+        pred_state[only_decel] = 0
+        pred_state[only_accel] = 2
+        if both.any():
+            pred_state[both] = np.where(
+                decel_score[both] >= accel_score[both],
+                0,
+                2,
+            )
+
+        three_state = float(
+            f1_score(
+                truth_state,
+                pred_state,
+                labels=[0, 1, 2],
+                average="macro",
+                zero_division=0,
+            )
+        )
+        result[f"aux/ordinal/three_state_macro_f1_thr_{tag}"] = three_state
+
+        decel_f1s.append(decel_f1)
+        accel_f1s.append(accel_f1)
+        three_state_f1s.append(three_state)
+        if np.isfinite(decel_auc):
+            decel_aucs.append(decel_auc)
+        if np.isfinite(accel_auc):
+            accel_aucs.append(accel_auc)
+
+    if decel_f1s:
+        result["aux/ordinal/mean_decel_f1"] = float(np.mean(decel_f1s))
+        result["aux/ordinal/mean_accel_f1"] = float(np.mean(accel_f1s))
+        result["aux/ordinal/mean_three_state_macro_f1"] = float(
+            np.mean(three_state_f1s)
+        )
+    if decel_aucs:
+        result["aux/ordinal/mean_decel_auc"] = float(np.mean(decel_aucs))
+    if accel_aucs:
+        result["aux/ordinal/mean_accel_auc"] = float(np.mean(accel_aucs))
+
+    return result
+
+
 class Stage3ValidationAccumulator:
     """Dataset-level validation metrics for continuous-CAN pretraining.
 
@@ -222,6 +346,10 @@ class Stage3ValidationAccumulator:
             "steering_deg": [],
         }
 
+        self._ordinal_truth_accel: list[np.ndarray] = []
+        self._ordinal_logits: list[np.ndarray] = []
+        self._ordinal_thresholds_mps2: np.ndarray | None = None
+
     def update(self, outputs, target, valid) -> None:
         target_np = target.detach().float().cpu().numpy()
         valid_np = valid.detach().cpu().numpy().astype(bool)
@@ -253,6 +381,63 @@ class Stage3ValidationAccumulator:
 
             denorm_truth[name] = truth
             denorm_pred[name] = pred
+
+        # Optional v3-A training-only ordinal head diagnostics. These are kept
+        # independent of proxy_rules and of the official metrics.py contract.
+        if "accel_ordinal_logits" in outputs:
+            ordinal = (
+                outputs["accel_ordinal_logits"]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+            )
+            thresholds_tensor = outputs.get(
+                "accel_ordinal_thresholds_mps2"
+            )
+            if thresholds_tensor is None:
+                raise KeyError(
+                    "accel_ordinal_logits present without "
+                    "accel_ordinal_thresholds_mps2"
+                )
+            thresholds = (
+                thresholds_tensor.detach().float().cpu().numpy().reshape(-1)
+            )
+            accel_idx = CAN_TARGETS.index("accel_from_speed_mps2")
+            ordinal_valid = (
+                valid_np[..., accel_idx]
+                & np.isfinite(denorm_truth["accel_from_speed_mps2"])
+                & np.isfinite(ordinal).all(axis=(-1, -2))
+            )
+
+            if ordinal.shape[:2] != target_np.shape[:2]:
+                raise ValueError(
+                    "ordinal logits B/T shape mismatch in validation: "
+                    f"{ordinal.shape[:2]} vs {target_np.shape[:2]}"
+                )
+            if ordinal.shape[2] != len(thresholds) or ordinal.shape[-1] != 2:
+                raise ValueError(
+                    "ordinal logits threshold/direction shape mismatch: "
+                    f"logits={ordinal.shape}, thresholds={thresholds.shape}"
+                )
+
+            if self._ordinal_thresholds_mps2 is None:
+                self._ordinal_thresholds_mps2 = thresholds.copy()
+            elif not np.allclose(
+                self._ordinal_thresholds_mps2, thresholds, atol=1e-6, rtol=0.0
+            ):
+                raise ValueError(
+                    "ordinal thresholds changed across validation batches"
+                )
+
+            if ordinal_valid.any():
+                self._ordinal_truth_accel.append(
+                    denorm_truth["accel_from_speed_mps2"][ordinal_valid]
+                    .astype(np.float32, copy=False)
+                )
+                self._ordinal_logits.append(
+                    ordinal[ordinal_valid].astype(np.float32, copy=False)
+                )
 
         if not self.proxy_rules:
             return
@@ -291,6 +476,19 @@ class Stage3ValidationAccumulator:
             result[f"reg/{name}/mae"] = float(state["abs"] / n)
             result[f"reg/{name}/rmse"] = float(np.sqrt(state["sq"] / n))
             result[f"reg/{name}/n"] = float(n)
+
+        if (
+            self._ordinal_truth_accel
+            and self._ordinal_logits
+            and self._ordinal_thresholds_mps2 is not None
+        ):
+            result.update(
+                _ordinal_aux_diagnostics(
+                    np.concatenate(self._ordinal_truth_accel),
+                    np.concatenate(self._ordinal_logits),
+                    self._ordinal_thresholds_mps2,
+                )
+            )
 
         if not self.proxy_rules:
             return result

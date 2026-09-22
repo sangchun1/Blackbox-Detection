@@ -41,13 +41,14 @@ def _weighted_masked_smooth_l1(
 
 
 def _parse_loss_config(payload: Mapping | None):
-    """Support both the legacy flat v1 loss map and the structured v2 map."""
+    """Support legacy v1 plus structured v2/v3 Stage-3 loss configs."""
     cfg = dict(payload or {})
 
     if "weights" in cfg or "mode" in cfg:
         mode = str(cfg.get("mode", "baseline")).lower()
         weights = dict(cfg.get("weights") or {})
         accel_v2 = dict(cfg.get("accel_v2") or {})
+        accel_v3 = dict(cfg.get("accel_v3") or {})
         normalization = dict(cfg.get("normalization") or {})
     else:
         # v1 compatibility:
@@ -55,9 +56,10 @@ def _parse_loss_config(payload: Mapping | None):
         mode = "baseline"
         weights = cfg
         accel_v2 = {}
+        accel_v3 = {}
         normalization = {}
 
-    return mode, weights, accel_v2, normalization
+    return mode, weights, accel_v2, accel_v3, normalization
 
 
 def _require_stat(normalization: Mapping, target: str) -> tuple[float, float]:
@@ -65,7 +67,8 @@ def _require_stat(normalization: Mapping, target: str) -> tuple[float, float]:
     if "mean" not in item or "std" not in item:
         raise KeyError(
             f"Structured Stage-3 loss requires normalization[{target!r}] "
-            "with mean/std. Notebook 07 injects target_stats.json at runtime."
+            "with mean/std. The Stage-3 training notebook injects "
+            "target_stats.json at runtime."
         )
     mean = float(item["mean"])
     std = max(float(item["std"]), 1e-6)
@@ -236,25 +239,141 @@ def _speed_accel_consistency_loss(
     )
 
 
+
+def _balanced_binary_bce(
+    logits: torch.Tensor,
+    positive: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Binary BCE with equal positive/negative contribution when both exist.
+
+    The acceleration-threshold tasks are deliberately balanced here so a rare
+    event cannot be solved by always predicting the negative class. This is
+    training-only auxiliary supervision and is unrelated to the DACON metric.
+    """
+    pos = valid & positive
+    neg = valid & ~positive
+    terms: list[torch.Tensor] = []
+
+    if pos.any():
+        terms.append(
+            F.binary_cross_entropy_with_logits(
+                logits[pos],
+                torch.ones_like(logits[pos]),
+                reduction="mean",
+            )
+        )
+    if neg.any():
+        terms.append(
+            F.binary_cross_entropy_with_logits(
+                logits[neg],
+                torch.zeros_like(logits[neg]),
+                reduction="mean",
+            )
+        )
+
+    if not terms:
+        return logits.sum() * 0.0
+    return torch.stack(terms).mean()
+
+
+def _accel_ordinal_aux_loss(
+    logits: torch.Tensor,
+    target_accel_normalized: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    accel_mean: float,
+    accel_std: float,
+    thresholds_mps2: list[float],
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Cumulative threshold supervision for deceleration and acceleration.
+
+    ``logits`` must be B x T x K x 2. The last dimension is:
+      0: target acceleration < -threshold  (decelerating event)
+      1: target acceleration > +threshold  (accelerating event)
+
+    Each threshold/direction is trained as its own balanced binary task. Using
+    several thresholds avoids treating any one guessed cutoff as DACON's hidden
+    label rule. The monotonic penalty enforces that event probability cannot
+    increase as the requested magnitude threshold becomes stricter.
+    """
+    if logits.ndim != 4 or logits.shape[-1] != 2:
+        raise ValueError(
+            "accel_ordinal_logits must have shape [B, T, K, 2], got "
+            f"{tuple(logits.shape)}"
+        )
+    if logits.shape[:2] != target_accel_normalized.shape:
+        raise ValueError(
+            "ordinal logits and accel targets must share B/T dimensions: "
+            f"{tuple(logits.shape[:2])} vs "
+            f"{tuple(target_accel_normalized.shape)}"
+        )
+    if logits.shape[2] != len(thresholds_mps2):
+        raise ValueError(
+            "ordinal logit threshold count mismatch: "
+            f"K={logits.shape[2]} vs {len(thresholds_mps2)} configured"
+        )
+
+    target_phys = _denormalize_tensor(
+        target_accel_normalized,
+        mean=accel_mean,
+        std=accel_std,
+    )
+
+    threshold_terms: list[torch.Tensor] = []
+    details: dict[str, torch.Tensor] = {}
+
+    for k, threshold in enumerate(thresholds_mps2):
+        threshold = float(threshold)
+        tag = f"{threshold:.2f}".replace(".", "p")
+
+        decel_loss = _balanced_binary_bce(
+            logits[..., k, 0],
+            target_phys < -threshold,
+            valid,
+        )
+        accel_loss = _balanced_binary_bce(
+            logits[..., k, 1],
+            target_phys > threshold,
+            valid,
+        )
+
+        details[f"decel_bce_thr_{tag}"] = decel_loss
+        details[f"accel_bce_thr_{tag}"] = accel_loss
+        threshold_terms.append(torch.stack([decel_loss, accel_loss]).mean())
+
+    if threshold_terms:
+        classification = torch.stack(threshold_terms).mean()
+    else:
+        classification = logits.sum() * 0.0
+
+    # Cumulative ordinal constraint: P(|a| > larger threshold) should not be
+    # greater than P(|a| > smaller threshold), separately per direction.
+    if logits.shape[2] > 1 and valid.any():
+        violations = F.relu(logits[:, :, 1:, :] - logits[:, :, :-1, :])
+        valid_pairs = valid[:, :, None, None].expand_as(violations)
+        monotonic = violations[valid_pairs].mean()
+    else:
+        monotonic = logits.sum() * 0.0
+
+    return classification, monotonic, details
+
 def can_multitask_loss(
     outputs: dict,
     target: torch.Tensor,
     valid: torch.Tensor,
     weights: Mapping | None = None,
 ):
-    """Stage-3 CAN loss with a backward-compatible accel-v2 mode.
+    """Stage-3 CAN loss with backward-compatible v1/v2/v3 modes.
 
-    v1 usage remains unchanged: pass a flat target->weight mapping.
-
-    v2 usage passes a structured mapping containing:
-      mode: accel_v2
-      weights: {target: scalar}
-      normalization: runtime target_stats.json values
-      accel_v2: auxiliary-loss settings
-
-    No categorical DACON labels or hidden DACON thresholds are used here.
+    v3-A is deliberately a controlled addition to v2: it keeps the exact v2
+    continuous objectives and adds an explicit multi-threshold acceleration
+    ordinal head. No DACON categorical labels or hidden DACON thresholds are
+    used in this pretraining loss.
     """
-    mode, base_weights, accel_v2, normalization = _parse_loss_config(weights)
+    mode, base_weights, accel_v2, accel_v3, normalization = _parse_loss_config(
+        weights
+    )
 
     total = target.new_tensor(0.0)
     parts: dict[str, float] = {}
@@ -272,7 +391,13 @@ def can_multitask_loss(
         plain_losses[name] = plain
         parts[name] = float(plain.detach().cpu())
 
-    if mode not in {"accel_v2", "accel-v2"}:
+    structured_accel_modes = {
+        "accel_v2",
+        "accel-v2",
+        "accel_v3_ordinal",
+        "accel-v3-ordinal",
+    }
+    if mode not in structured_accel_modes:
         for name in CAN_TARGETS:
             total = total + float(base_weights.get(name, 1.0)) * plain_losses[name]
         parts["total"] = float(total.detach().cpu())
@@ -383,6 +508,69 @@ def can_multitask_loss(
         parts["accel_v2/speed_accel_consistency"] = float(
             consistency_loss.detach().cpu()
         )
+
+    if mode in {"accel_v3_ordinal", "accel-v3-ordinal"}:
+        ordinal_cfg = dict(accel_v3.get("ordinal") or {})
+        ordinal_weight = float(ordinal_cfg.get("weight", 0.0))
+        monotonic_weight = float(ordinal_cfg.get("monotonic_weight", 0.0))
+        thresholds = [
+            float(x)
+            for x in ordinal_cfg.get(
+                "thresholds_mps2",
+                [0.10, 0.20, 0.30, 0.50],
+            )
+        ]
+
+        if ordinal_weight > 0:
+            if "accel_ordinal_logits" not in outputs:
+                raise KeyError(
+                    "accel_v3_ordinal requires model output "
+                    "'accel_ordinal_logits'"
+                )
+
+            model_thresholds = outputs.get(
+                "accel_ordinal_thresholds_mps2"
+            )
+            if model_thresholds is not None:
+                model_values = [
+                    float(x)
+                    for x in model_thresholds.detach().cpu().tolist()
+                ]
+                if len(model_values) != len(thresholds) or any(
+                    abs(a - b) > 1e-6
+                    for a, b in zip(model_values, thresholds, strict=True)
+                ):
+                    raise ValueError(
+                        "model/loss ordinal thresholds differ: "
+                        f"model={model_values}, loss={thresholds}"
+                    )
+
+            ordinal_bce, ordinal_monotonic, ordinal_details = (
+                _accel_ordinal_aux_loss(
+                    outputs["accel_ordinal_logits"],
+                    target[..., accel_idx],
+                    accel_valid,
+                    accel_mean=accel_mean,
+                    accel_std=accel_std,
+                    thresholds_mps2=thresholds,
+                )
+            )
+            ordinal_total = (
+                ordinal_bce + monotonic_weight * ordinal_monotonic
+            )
+            total = total + ordinal_weight * ordinal_total
+
+            parts["accel_v3/ordinal_bce"] = float(
+                ordinal_bce.detach().cpu()
+            )
+            parts["accel_v3/ordinal_monotonic"] = float(
+                ordinal_monotonic.detach().cpu()
+            )
+            parts["accel_v3/ordinal_total"] = float(
+                ordinal_total.detach().cpu()
+            )
+            for key, value in ordinal_details.items():
+                parts[f"accel_v3/{key}"] = float(value.detach().cpu())
 
     parts["total"] = float(total.detach().cpu())
     return total, parts
