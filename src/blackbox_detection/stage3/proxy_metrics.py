@@ -41,13 +41,8 @@ class ProxyRule:
 def assert_dacon_metric_contract() -> None:
     """Guard the official Stage 3 metric implementation against accidental drift.
 
-    The three checks mirror the already-passed 00b notebook:
-      * perfect prediction + GT STOPPED steering exclusion,
-      * Macro-F1 over the full defined class set,
-      * predicted STOPPED does not mask steering rows.
-
-    This function does not implement a second metric. It only exercises
-    :func:`dacon_stage3_metrics` from ``metrics.py``.
+    This does not implement a second competition metric. It only exercises
+    dacon_stage3_metrics() from the locked metrics.py implementation.
     """
 
     result = dacon_stage3_metrics(
@@ -91,8 +86,7 @@ def _proxy_labels(
 
     Steering sign convention is used consistently for truth and prediction, so
     the Macro-F1 is invariant to a global LEFT/RIGHT sign swap. Per-class LEFT
-    vs RIGHT values should therefore be treated as diagnostic only until the
-    target-domain sign convention is explicitly confirmed.
+    vs RIGHT values remain diagnostic until target-domain sign is confirmed.
     """
 
     speed = np.asarray(speed_mps, dtype=np.float64)
@@ -126,6 +120,7 @@ def _per_class_f1(
         average=None,
         zero_division=0,
     )
+
     moving = truth_accel != "STOPPED"
     if moving.any():
         steer_scores = f1_score(
@@ -146,15 +141,58 @@ def _per_class_f1(
     return result
 
 
+def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size < 2 or np.std(x) < 1e-12 or np.std(y) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _accel_shape_diagnostics(
+    truth_accel: np.ndarray,
+    pred_accel: np.ndarray,
+) -> dict[str, float]:
+    truth = np.asarray(truth_accel, dtype=np.float64)
+    pred = np.asarray(pred_accel, dtype=np.float64)
+    finite = np.isfinite(truth) & np.isfinite(pred)
+    truth = truth[finite]
+    pred = pred[finite]
+
+    if truth.size == 0:
+        return {}
+
+    truth_std = float(np.std(truth))
+    pred_std = float(np.std(pred))
+    if truth.size >= 2 and truth_std > 1e-12:
+        slope = float(np.polyfit(truth, pred, deg=1)[0])
+    else:
+        slope = 0.0
+
+    return {
+        "diag/accel/gt_std_mps2": truth_std,
+        "diag/accel/pred_std_mps2": pred_std,
+        "diag/accel/pred_to_gt_std_ratio": float(
+            pred_std / max(truth_std, 1e-12)
+        ),
+        "diag/accel/correlation": _safe_corr(truth, pred),
+        "diag/accel/pred_vs_gt_slope": slope,
+        "diag/accel/pred_abs_p95_mps2": float(
+            np.quantile(np.abs(pred), 0.95)
+        ),
+        "diag/accel/gt_abs_p95_mps2": float(
+            np.quantile(np.abs(truth), 0.95)
+        ),
+    }
+
+
 class Stage3ValidationAccumulator:
     """Dataset-level validation metrics for continuous-CAN pretraining.
 
-    Regression MAE/RMSE is accumulated globally over all valid frames, avoiding
-    the previous "mean of per-batch RMSE" approximation.
-
-    Proxy Macro-F1 uses continuous ground truth and predictions converted with
-    the same diagnostic threshold rule, then delegates the actual score
-    semantics to the locked official-style ``dacon_stage3_metrics`` function.
+    Regression MAE/RMSE is accumulated globally over all valid frames.
+    Proxy Macro-F1 delegates its score semantics to dacon_stage3_metrics() from
+    the locked metrics.py. Additional accel-shape diagnostics are continuous
+    diagnostics only; they are not competition metrics.
     """
 
     def __init__(
@@ -172,6 +210,7 @@ class Stage3ValidationAccumulator:
             name: {"n": 0, "abs": 0.0, "sq": 0.0}
             for name in CAN_TARGETS
         }
+
         self._proxy_truth: dict[str, list[np.ndarray]] = {
             "speed_mps": [],
             "accel_from_speed_mps2": [],
@@ -203,7 +242,10 @@ class Stage3ValidationAccumulator:
             )
 
             if mask.any():
-                err = pred[mask].astype(np.float64) - truth[mask].astype(np.float64)
+                err = (
+                    pred[mask].astype(np.float64)
+                    - truth[mask].astype(np.float64)
+                )
                 state = self._reg[name]
                 state["n"] += int(err.size)
                 state["abs"] += float(np.abs(err).sum())
@@ -217,8 +259,13 @@ class Stage3ValidationAccumulator:
 
         indices = {
             name: CAN_TARGETS.index(name)
-            for name in ("speed_mps", "accel_from_speed_mps2", "steering_deg")
+            for name in (
+                "speed_mps",
+                "accel_from_speed_mps2",
+                "steering_deg",
+            )
         }
+
         common = np.ones(target_np.shape[:-1], dtype=bool)
         for name, idx in indices.items():
             common &= valid_np[..., idx]
@@ -260,6 +307,13 @@ class Stage3ValidationAccumulator:
             for name, values in self._proxy_pred.items()
         }
 
+        result.update(
+            _accel_shape_diagnostics(
+                truth["accel_from_speed_mps2"],
+                pred["accel_from_speed_mps2"],
+            )
+        )
+
         stage3_scores: list[float] = []
         accel_scores: list[float] = []
         steer_scores: list[float] = []
@@ -287,12 +341,26 @@ class Stage3ValidationAccumulator:
 
             prefix = f"proxy/{rule_name}"
             result[f"{prefix}/stage3_score"] = official_semantics["stage3_score"]
-            result[f"{prefix}/accel_macro_f1"] = official_semantics["accel_macro_f1"]
-            result[f"{prefix}/steer_macro_f1"] = official_semantics["steer_macro_f1"]
+            result[f"{prefix}/accel_macro_f1"] = official_semantics[
+                "accel_macro_f1"
+            ]
+            result[f"{prefix}/steer_macro_f1"] = official_semantics[
+                "steer_macro_f1"
+            ]
             result[f"{prefix}/steer_eval_frames"] = float(
                 official_semantics["steer_eval_frames"]
             )
             result[f"{prefix}/eval_frames"] = float(len(truth_accel))
+
+            dynamic = np.isin(
+                truth_accel,
+                ["ACCELERATING", "DECELERATING"],
+            )
+            if dynamic.any():
+                result[f"{prefix}/dynamic_to_constant_rate"] = float(
+                    np.mean(pred_accel[dynamic] == "CONSTANT")
+                )
+                result[f"{prefix}/dynamic_fraction"] = float(dynamic.mean())
 
             for key, value in _per_class_f1(
                 truth_accel,
@@ -306,11 +374,21 @@ class Stage3ValidationAccumulator:
             accel_scores.append(float(official_semantics["accel_macro_f1"]))
             steer_scores.append(float(official_semantics["steer_macro_f1"]))
 
-        result["proxy/robust_mean_stage3_score"] = float(np.mean(stage3_scores))
-        result["proxy/robust_min_stage3_score"] = float(np.min(stage3_scores))
-        result["proxy/robust_max_stage3_score"] = float(np.max(stage3_scores))
-        result["proxy/robust_mean_accel_macro_f1"] = float(np.mean(accel_scores))
-        result["proxy/robust_mean_steer_macro_f1"] = float(np.mean(steer_scores))
+        result["proxy/robust_mean_stage3_score"] = float(
+            np.mean(stage3_scores)
+        )
+        result["proxy/robust_min_stage3_score"] = float(
+            np.min(stage3_scores)
+        )
+        result["proxy/robust_max_stage3_score"] = float(
+            np.max(stage3_scores)
+        )
+        result["proxy/robust_mean_accel_macro_f1"] = float(
+            np.mean(accel_scores)
+        )
+        result["proxy/robust_mean_steer_macro_f1"] = float(
+            np.mean(steer_scores)
+        )
 
         return result
 
