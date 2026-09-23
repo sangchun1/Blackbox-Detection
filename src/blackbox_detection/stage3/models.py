@@ -92,8 +92,12 @@ class DenseTemporalCANHead(nn.Module):
                 2,
             )
             outputs["accel_ordinal_logits"] = ordinal
+            # Thresholds are metadata, not activations.  Keep them in FP32 even
+            # under bf16 autocast; otherwise values such as 0.1 become
+            # 0.10009765625 and the model/loss contract check falsely fails.
             outputs["accel_ordinal_thresholds_mps2"] = ordinal.new_tensor(
-                self.accel_ordinal_thresholds_mps2
+                self.accel_ordinal_thresholds_mps2,
+                dtype=torch.float32,
             )
 
         return outputs
