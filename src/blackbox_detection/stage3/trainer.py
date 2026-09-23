@@ -401,7 +401,7 @@ class CANTrainer:
                 for key, value in parts.items():
                     if key != "total":
                         payload[f"train_step/{key}"] = float(value)
-                log_metrics(payload, step=self.global_step)
+                log_metrics(payload)
 
         progress.close()
 
@@ -597,7 +597,7 @@ class CANTrainer:
                     payload.update(
                         {f"val/{key}": value for key, value in backfilled.items()}
                     )
-                    log_metrics(payload, step=self.global_step)
+                    log_metrics(payload)
 
         if start_epoch > int(epochs):
             self.logger.info(
@@ -688,7 +688,7 @@ class CANTrainer:
                 payload.update({f"val/{k}": v for k, v in val.items()})
                 # Use global optimizer step everywhere. Epoch itself is logged
                 # as a metric, avoiding W&B step resets after dense train logs.
-                log_metrics(payload, step=self.global_step)
+                log_metrics(payload)
 
             if (
                 int(early_stopping_patience) > 0
