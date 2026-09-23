@@ -41,7 +41,7 @@ def _weighted_masked_smooth_l1(
 
 
 def _parse_loss_config(payload: Mapping | None):
-    """Support legacy v1 plus structured v2/v3 Stage-3 loss configs."""
+    """Support legacy v1 plus structured v2/v3/v4 Stage-3 loss configs."""
     cfg = dict(payload or {})
 
     if "weights" in cfg or "mode" in cfg:
@@ -49,6 +49,7 @@ def _parse_loss_config(payload: Mapping | None):
         weights = dict(cfg.get("weights") or {})
         accel_v2 = dict(cfg.get("accel_v2") or {})
         accel_v3 = dict(cfg.get("accel_v3") or {})
+        accel_v4 = dict(cfg.get("accel_v4") or {})
         normalization = dict(cfg.get("normalization") or {})
     else:
         # v1 compatibility:
@@ -57,9 +58,10 @@ def _parse_loss_config(payload: Mapping | None):
         weights = cfg
         accel_v2 = {}
         accel_v3 = {}
+        accel_v4 = {}
         normalization = {}
 
-    return mode, weights, accel_v2, accel_v3, normalization
+    return mode, weights, accel_v2, accel_v3, accel_v4, normalization
 
 
 def _require_stat(normalization: Mapping, target: str) -> tuple[float, float]:
@@ -364,16 +366,21 @@ def can_multitask_loss(
     valid: torch.Tensor,
     weights: Mapping | None = None,
 ):
-    """Stage-3 CAN loss with backward-compatible v1/v2/v3 modes.
+    """Stage-3 CAN loss with backward-compatible v1/v2/v3/v4 modes.
 
-    v3-A is deliberately a controlled addition to v2: it keeps the exact v2
-    continuous objectives and adds an explicit multi-threshold acceleration
-    ordinal head. No DACON categorical labels or hidden DACON thresholds are
-    used in this pretraining loss.
+    v4-A keeps the v3-A objectives but the model's primary acceleration output
+    is a residual fusion of the scalar regression branch and ordinal branch.
+    The fusion itself is supervised by the same continuous-CAN objectives; no
+    DACON categorical labels or hidden DACON thresholds are introduced.
     """
-    mode, base_weights, accel_v2, accel_v3, normalization = _parse_loss_config(
-        weights
-    )
+    (
+        mode,
+        base_weights,
+        accel_v2,
+        accel_v3,
+        accel_v4,
+        normalization,
+    ) = _parse_loss_config(weights)
 
     total = target.new_tensor(0.0)
     parts: dict[str, float] = {}
@@ -396,6 +403,8 @@ def can_multitask_loss(
         "accel-v2",
         "accel_v3_ordinal",
         "accel-v3-ordinal",
+        "accel_v4_fusion",
+        "accel-v4-fusion",
     }
     if mode not in structured_accel_modes:
         for name in CAN_TARGETS:
@@ -509,7 +518,12 @@ def can_multitask_loss(
             consistency_loss.detach().cpu()
         )
 
-    if mode in {"accel_v3_ordinal", "accel-v3-ordinal"}:
+    if mode in {
+        "accel_v3_ordinal",
+        "accel-v3-ordinal",
+        "accel_v4_fusion",
+        "accel-v4-fusion",
+    }:
         ordinal_cfg = dict(accel_v3.get("ordinal") or {})
         ordinal_weight = float(ordinal_cfg.get("weight", 0.0))
         monotonic_weight = float(ordinal_cfg.get("monotonic_weight", 0.0))
@@ -571,6 +585,43 @@ def can_multitask_loss(
             )
             for key, value in ordinal_details.items():
                 parts[f"accel_v3/{key}"] = float(value.detach().cpu())
+
+    if mode in {"accel_v4_fusion", "accel-v4-fusion"}:
+        if "accel_raw_from_speed_mps2" not in outputs:
+            raise KeyError(
+                "accel_v4_fusion requires model output "
+                "'accel_raw_from_speed_mps2'"
+            )
+
+        raw_accel = outputs["accel_raw_from_speed_mps2"]
+        fused_accel = outputs["accel_from_speed_mps2"]
+        raw_plain = masked_smooth_l1(
+            raw_accel,
+            target[..., accel_idx],
+            accel_valid,
+            beta=0.5,
+        )
+        delta = fused_accel - raw_accel
+
+        parts["accel_v4/raw_smooth_l1"] = float(raw_plain.detach().cpu())
+        if accel_valid.any():
+            parts["accel_v4/fused_minus_raw_abs_mean"] = float(
+                delta[accel_valid].abs().mean().detach().cpu()
+            )
+        else:
+            parts["accel_v4/fused_minus_raw_abs_mean"] = 0.0
+
+        gate = outputs.get("accel_fusion_gate")
+        if gate is not None:
+            parts["accel_v4/fusion_gate"] = float(
+                gate.detach().float().mean().cpu()
+            )
+
+        signed = outputs.get("accel_ordinal_signed_score")
+        if signed is not None and accel_valid.any():
+            parts["accel_v4/ordinal_signed_abs_mean"] = float(
+                signed[accel_valid].abs().mean().detach().cpu()
+            )
 
     parts["total"] = float(total.detach().cpu())
     return total, parts

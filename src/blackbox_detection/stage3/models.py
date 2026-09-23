@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 
 import torch
 from torch import nn
@@ -17,6 +18,10 @@ class DenseTemporalCANHead(nn.Module):
         hidden: int = 256,
         layers: int = 2,
         accel_ordinal_thresholds_mps2: Sequence[float] | None = None,
+        accel_fusion_enabled: bool = False,
+        accel_fusion_hidden: int = 64,
+        accel_fusion_gate_init: float = 0.10,
+        accel_fusion_detach_ordinal_inputs: bool = True,
     ):
         super().__init__()
         self.project = nn.Sequential(
@@ -64,6 +69,40 @@ class DenseTemporalCANHead(nn.Module):
             else None
         )
 
+        self.accel_fusion_enabled = bool(accel_fusion_enabled)
+        self.accel_fusion_detach_ordinal_inputs = bool(
+            accel_fusion_detach_ordinal_inputs
+        )
+        if self.accel_fusion_enabled and not thresholds:
+            raise ValueError(
+                "accel fusion requires non-empty ordinal thresholds"
+            )
+
+        if self.accel_fusion_enabled:
+            fusion_hidden = max(int(accel_fusion_hidden), 8)
+            # raw accel + 2*K probabilities + signed score +
+            # threshold-weighted signed score + activity score.
+            fusion_input_dim = 1 + 2 * len(thresholds) + 3
+            self.accel_fusion_mlp = nn.Sequential(
+                nn.Linear(fusion_input_dim, fusion_hidden),
+                nn.GELU(),
+                nn.LayerNorm(fusion_hidden),
+                nn.Linear(fusion_hidden, 1),
+            )
+            # Exact warm-start preservation: the new residual starts at zero,
+            # so a v3-A checkpoint produces identical scalar acceleration before
+            # the first v4-A optimizer step.
+            nn.init.zeros_(self.accel_fusion_mlp[-1].weight)
+            nn.init.zeros_(self.accel_fusion_mlp[-1].bias)
+
+            gate_init = min(max(float(accel_fusion_gate_init), 1e-4), 1.0 - 1e-4)
+            self.accel_fusion_gate_logit = nn.Parameter(
+                torch.tensor(math.log(gate_init / (1.0 - gate_init)))
+            )
+        else:
+            self.accel_fusion_mlp = None
+            self.register_parameter("accel_fusion_gate_logit", None)
+
     def forward(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
         # z: B T D
         d1 = torch.cat(
@@ -100,6 +139,56 @@ class DenseTemporalCANHead(nn.Module):
                 dtype=torch.float32,
             )
 
+            if self.accel_fusion_mlp is not None:
+                raw_accel = outputs["accel_from_speed_mps2"]
+
+                ordinal_probs = torch.sigmoid(ordinal)
+                if self.accel_fusion_detach_ordinal_inputs:
+                    ordinal_probs_for_fusion = ordinal_probs.detach()
+                else:
+                    ordinal_probs_for_fusion = ordinal_probs
+
+                decel_prob = ordinal_probs_for_fusion[..., 0]
+                accel_prob = ordinal_probs_for_fusion[..., 1]
+                signed_score = accel_prob.mean(dim=-1) - decel_prob.mean(dim=-1)
+                activity_score = 0.5 * (
+                    accel_prob.mean(dim=-1) + decel_prob.mean(dim=-1)
+                )
+
+                threshold_tensor = ordinal.new_tensor(
+                    self.accel_ordinal_thresholds_mps2,
+                    dtype=ordinal_probs_for_fusion.dtype,
+                )
+                threshold_weight = threshold_tensor / threshold_tensor.sum().clamp_min(1e-6)
+                signed_magnitude_score = (
+                    (accel_prob - decel_prob) * threshold_weight
+                ).sum(dim=-1)
+
+                fusion_input = torch.cat(
+                    [
+                        raw_accel.unsqueeze(-1),
+                        ordinal_probs_for_fusion.flatten(start_dim=2),
+                        signed_score.unsqueeze(-1),
+                        signed_magnitude_score.unsqueeze(-1),
+                        activity_score.unsqueeze(-1),
+                    ],
+                    dim=-1,
+                )
+                residual = self.accel_fusion_mlp(fusion_input).squeeze(-1)
+                gate = torch.sigmoid(self.accel_fusion_gate_logit).to(
+                    dtype=residual.dtype
+                )
+                fused_accel = raw_accel + gate * residual
+
+                outputs["accel_raw_from_speed_mps2"] = raw_accel
+                outputs["accel_fusion_residual"] = residual
+                outputs["accel_fusion_gate"] = gate
+                outputs["accel_ordinal_signed_score"] = signed_score
+                outputs["accel_ordinal_signed_magnitude_score"] = (
+                    signed_magnitude_score
+                )
+                outputs["accel_from_speed_mps2"] = fused_accel
+
         return outputs
 
 
@@ -115,6 +204,10 @@ class VJEPA21DenseCAN(nn.Module):
         temporal_hidden: int = 256,
         temporal_layers: int = 2,
         accel_ordinal_thresholds_mps2: Sequence[float] | None = None,
+        accel_fusion_enabled: bool = False,
+        accel_fusion_hidden: int = 64,
+        accel_fusion_gate_init: float = 0.10,
+        accel_fusion_detach_ordinal_inputs: bool = True,
     ):
         super().__init__()
         self.backbone = backbone
@@ -128,6 +221,12 @@ class VJEPA21DenseCAN(nn.Module):
             temporal_hidden,
             temporal_layers,
             accel_ordinal_thresholds_mps2=accel_ordinal_thresholds_mps2,
+            accel_fusion_enabled=accel_fusion_enabled,
+            accel_fusion_hidden=accel_fusion_hidden,
+            accel_fusion_gate_init=accel_fusion_gate_init,
+            accel_fusion_detach_ordinal_inputs=(
+                accel_fusion_detach_ordinal_inputs
+            ),
         )
 
     def train(self, mode: bool = True):

@@ -152,6 +152,8 @@ def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
 def _accel_shape_diagnostics(
     truth_accel: np.ndarray,
     pred_accel: np.ndarray,
+    *,
+    prefix: str = "diag/accel",
 ) -> dict[str, float]:
     truth = np.asarray(truth_accel, dtype=np.float64)
     pred = np.asarray(pred_accel, dtype=np.float64)
@@ -170,17 +172,17 @@ def _accel_shape_diagnostics(
         slope = 0.0
 
     return {
-        "diag/accel/gt_std_mps2": truth_std,
-        "diag/accel/pred_std_mps2": pred_std,
-        "diag/accel/pred_to_gt_std_ratio": float(
+        f"{prefix}/gt_std_mps2": truth_std,
+        f"{prefix}/pred_std_mps2": pred_std,
+        f"{prefix}/pred_to_gt_std_ratio": float(
             pred_std / max(truth_std, 1e-12)
         ),
-        "diag/accel/correlation": _safe_corr(truth, pred),
-        "diag/accel/pred_vs_gt_slope": slope,
-        "diag/accel/pred_abs_p95_mps2": float(
+        f"{prefix}/correlation": _safe_corr(truth, pred),
+        f"{prefix}/pred_vs_gt_slope": slope,
+        f"{prefix}/pred_abs_p95_mps2": float(
             np.quantile(np.abs(pred), 0.95)
         ),
-        "diag/accel/gt_abs_p95_mps2": float(
+        f"{prefix}/gt_abs_p95_mps2": float(
             np.quantile(np.abs(truth), 0.95)
         ),
     }
@@ -346,6 +348,10 @@ class Stage3ValidationAccumulator:
             "steering_deg": [],
         }
 
+        self._raw_accel_truth: list[np.ndarray] = []
+        self._raw_accel_pred: list[np.ndarray] = []
+        self._fused_accel_pred_for_raw: list[np.ndarray] = []
+
         self._ordinal_truth_accel: list[np.ndarray] = []
         self._ordinal_logits: list[np.ndarray] = []
         self._ordinal_thresholds_mps2: np.ndarray | None = None
@@ -466,6 +472,33 @@ class Stage3ValidationAccumulator:
                     denorm_pred[name][common].astype(np.float32, copy=False)
                 )
 
+            raw_key = "accel_raw_from_speed_mps2"
+            if raw_key in outputs:
+                raw_norm = (
+                    outputs[raw_key]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+                raw_pred = denormalize(
+                    raw_norm,
+                    self.stats["accel_from_speed_mps2"],
+                )
+                raw_common = common & np.isfinite(raw_pred)
+                if raw_common.any():
+                    self._raw_accel_truth.append(
+                        denorm_truth["accel_from_speed_mps2"][raw_common]
+                        .astype(np.float32, copy=False)
+                    )
+                    self._raw_accel_pred.append(
+                        raw_pred[raw_common].astype(np.float32, copy=False)
+                    )
+                    self._fused_accel_pred_for_raw.append(
+                        denorm_pred["accel_from_speed_mps2"][raw_common]
+                        .astype(np.float32, copy=False)
+                    )
+
     def compute(self) -> dict[str, float]:
         result: dict[str, float] = {}
 
@@ -511,6 +544,25 @@ class Stage3ValidationAccumulator:
                 pred["accel_from_speed_mps2"],
             )
         )
+
+        if self._raw_accel_truth:
+            raw_truth = np.concatenate(self._raw_accel_truth)
+            raw_pred = np.concatenate(self._raw_accel_pred)
+            fused_for_raw = np.concatenate(self._fused_accel_pred_for_raw)
+            result.update(
+                _accel_shape_diagnostics(
+                    raw_truth,
+                    raw_pred,
+                    prefix="diag/accel_raw",
+                )
+            )
+            delta = fused_for_raw.astype(np.float64) - raw_pred.astype(np.float64)
+            result["diag/accel_fusion/fused_minus_raw_abs_mean_mps2"] = float(
+                np.mean(np.abs(delta))
+            )
+            result["diag/accel_fusion/fused_minus_raw_std_mps2"] = float(
+                np.std(delta)
+            )
 
         stage3_scores: list[float] = []
         accel_scores: list[float] = []

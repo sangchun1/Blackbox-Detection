@@ -1,0 +1,136 @@
+seed: 20260918
+
+experiment:
+  name: vjepa21b_can_v4a_ordinal_fusion
+
+data:
+  clip_len: 16
+  window_stride: 16
+  input_height: 288
+  input_width: 384
+  num_workers: 2
+  train_random_flip: true
+  max_train_windows: 12000
+  max_val_windows: 4000
+
+model:
+  backbone: vjepa2_1_vit_base_384
+  out_layers: [2, 5, 8, 11]
+  freeze_backbone: true
+  temporal_hidden: 256
+  temporal_layers: 2
+  feature_dim: 384
+
+  # Training-only ordinal branch inherited from v3-A.
+  # These are NOT DACON class thresholds.
+  accel_ordinal_thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+
+  # v4-A: explicitly feed the learned ordinal representation back into the
+  # scalar acceleration prediction through a zero-initialized residual fusion.
+  accel_fusion:
+    enabled: true
+    hidden: 64
+    gate_init: 0.10
+
+    # Keep the v3-A ordinal representation protected from scalar-regression
+    # gradients. The ordinal head still trains through its own balanced BCE.
+    detach_ordinal_inputs: true
+
+# v4-A is a continuation experiment from v3-A best.pt, but starts a fresh
+# optimizer/scheduler. Old head parameters use a conservative LR while the new
+# fusion parameters learn faster.
+training:
+  epochs: 3
+  batch_size: 2
+  grad_accum_steps: 4
+
+  # Existing v3-A head/temporal parameters.
+  learning_rate: 0.00005
+
+  # New residual-fusion parameters only.
+  fusion_learning_rate: 0.00020
+
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  min_learning_rate_ratio: 0.05
+  grad_clip_norm: 1.0
+  amp_dtype: bf16
+  max_steps_per_epoch: 2000
+  max_val_steps: 500
+  early_stopping_patience: 0
+  log_interval: 20
+
+warm_start:
+  run_name: vjepa21b_can_v3a_ordinal_frozen
+  checkpoint: best.pt
+  strict_old_weights: true
+
+# metrics.py remains untouched. v4-A changes how the scalar acceleration output
+# is formed, while keeping the same continuous-CAN and ordinal objectives.
+loss:
+  mode: accel_v4_fusion
+
+  weights:
+    speed_mps: 1.0
+    accel_from_speed_mps2: 1.5
+    steering_deg: 1.5
+    yaw_rate_rps: 0.75
+
+  # Notebook 09 injects target_stats.json here at runtime.
+  normalization: {}
+
+  accel_v2:
+    magnitude_weighted_regression:
+      scale_mps2: 0.30
+      gain: 2.0
+      max_weight: 3.0
+      beta: 0.5
+
+    multi_threshold_margin:
+      weight: 0.75
+      thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+      temperature_mps2: 0.05
+
+    speed_delta:
+      weight: 0.5
+      beta_normalized: 0.01
+
+    speed_accel_consistency:
+      weight: 0.10
+      speed_delta_scale_normalized: 0.01
+      accel_scale_normalized: 0.50
+      beta: 0.50
+
+  accel_v3:
+    ordinal:
+      weight: 0.75
+      thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+      monotonic_weight: 0.10
+
+  # No extra competition-derived labels are added here. The fusion is optimized
+  # by the existing continuous acceleration objectives above.
+  accel_v4:
+    fusion:
+      diagnostics_only: true
+
+# Diagnostic only. These are NOT DACON's hidden labeling thresholds.
+validation:
+  backfill_on_resume: true
+  proxy_rules:
+    sensitive:
+      stop_speed_mps: 0.30
+      accel_deadzone_mps2: 0.10
+      steer_deadzone_deg: 2.0
+    medium:
+      stop_speed_mps: 0.50
+      accel_deadzone_mps2: 0.20
+      steer_deadzone_deg: 5.0
+    conservative:
+      stop_speed_mps: 1.00
+      accel_deadzone_mps2: 0.30
+      steer_deadzone_deg: 8.0
+
+logging:
+  wandb_enabled: true
+  wandb_project: blackbox-stage3
+  wandb_group: vjepa21b_can_accel_v4a
