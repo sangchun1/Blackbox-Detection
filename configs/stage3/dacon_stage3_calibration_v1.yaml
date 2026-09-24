@@ -1,0 +1,49 @@
+seed: 20260924
+
+experiment:
+  name: dacon_stage3_calibration_v1
+  source_model: vjepa21b_can_v4a_ordinal_fusion
+  source_checkpoint: best.pt
+
+public_data:
+  # Notebook 10 first searches extracted Stage 3 example folders. If none are
+  # found, it can extract only the Stage 3 members from Baseline.zip.
+  extracted_root_candidates:
+    - /content/drive/MyDrive/Blackbox-Detection/DATASET/stage3
+    - /content/drive/MyDrive/Blackbox-Detection/DATASET/dacon/stage3
+    - /content/drive/MyDrive/Blackbox-Detection/Baseline/data/stage3
+  baseline_zip_candidates:
+    - /content/drive/MyDrive/Blackbox-Detection/Baseline.zip
+    - /content/drive/MyDrive/Blackbox-Detection/DATASET/Baseline.zip
+
+inference:
+  batch_size: 2
+  # Match comma2k19 training windows and keep submission runtime conservative.
+  window_stride: 16
+
+calibration:
+  ordinal_thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+  top_k_scalar: 24
+
+  accel_grid:
+    source: [fused, raw]
+    smoothing_window: [1, 3, 5]
+    stop_speed_mps: [0.10, 0.20, 0.30, 0.50, 0.75, 1.00]
+    accel_deadzone_pos_mps2: [0.05, 0.10, 0.15, 0.20, 0.30, 0.40]
+    accel_deadzone_neg_mps2: [0.05, 0.10, 0.15, 0.20, 0.30, 0.40]
+    accel_bias_mps2: [-0.05, 0.00, 0.05]
+    ordinal_blend: [0.00, 0.25, 0.50, 0.75, 1.00]
+    ordinal_scale_mps2: [0.25, 0.50, 0.75, 1.00]
+
+  steer_grid:
+    smoothing_window: [1, 3, 5]
+    steering_sign: [1, -1]
+    steering_bias_deg: [-3.0, -1.5, 0.0, 1.5, 3.0]
+    left_deadzone_deg: [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 18.0]
+    right_deadzone_deg: [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 18.0]
+
+selection:
+  # The public example is tiny and DACON explicitly says it is not the hidden
+  # evaluation distribution. Use LOVO consensus as the default first-submission
+  # calibration; all-label best is also exported for an optional second run.
+  default: lovo_consensus
