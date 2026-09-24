@@ -10,6 +10,10 @@ import sys
 import zipfile
 from pathlib import Path
 
+# Stage 3 inference implementation is embedded here so the builder does not
+# depend on any file under the gitignored submissions/ directory.
+STAGE3_V4_BLOCK = '# ---------------------------------------------------------------------------\n# Stage 3: V-JEPA 2.1-B v4-A continuous-CAN + calibrated categorical mapping\n# ---------------------------------------------------------------------------\n# Stage 1 / Stage 2 above are intentionally kept byte-identical to stage1_a7.\n#\n# Stage 3 assets:\n#   model/stage3/model.ts\n#   model/stage3/target_stats.json\n#   model/stage3/calibration.json\n#\n# The Stage 3 network is exported to TorchScript at build time. Therefore the\n# DACON evaluator does not need the facebookresearch/vjepa2 repository, timm,\n# einops, or any network download to construct this model.\n\nS3_V4_NUM_FRAMES = 16\nS3_V4_HEIGHT = 288\nS3_V4_WIDTH = 384\nS3_V4_BATCH = 2\n\nS3_V4_MEAN = torch.tensor(\n    [0.485, 0.456, 0.406],\n    dtype=torch.float32,\n)[:, None, None, None]\nS3_V4_STD = torch.tensor(\n    [0.229, 0.224, 0.225],\n    dtype=torch.float32,\n)[:, None, None, None]\n\n\ndef _stage3_v4_resize_rgb(bgr: np.ndarray) -> np.ndarray:\n    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)\n    return cv2.resize(\n        rgb,\n        (S3_V4_WIDTH, S3_V4_HEIGHT),\n        interpolation=cv2.INTER_AREA,\n    )\n\n\ndef _stage3_v4_denormalize(\n    values: np.ndarray,\n    stats: dict,\n    name: str,\n) -> np.ndarray:\n    stat = stats[name]\n    return (\n        values.astype(np.float32, copy=False) * float(stat["std"])\n        + float(stat["mean"])\n    )\n\n\ndef _stage3_v4_centered_mean(\n    values: np.ndarray,\n    window: int,\n) -> np.ndarray:\n    window = int(window)\n    if window <= 1:\n        return np.asarray(values, dtype=np.float32)\n    if window % 2 == 0:\n        raise ValueError(\n            f"Stage 3 smoothing window must be odd, got {window}"\n        )\n\n    return (\n        pd.Series(np.asarray(values, dtype=np.float32))\n        .rolling(\n            window=window,\n            center=True,\n            min_periods=1,\n        )\n        .mean()\n        .to_numpy(dtype=np.float32)\n    )\n\n\ndef _stage3_v4_flush_batch(\n    model,\n    clips,\n    valid_lengths,\n    device,\n    stats,\n    speed_parts,\n    fused_accel_parts,\n    raw_accel_parts,\n    steering_parts,\n):\n    """Run one fixed-size Stage 3 TorchScript batch.\n\n    model.ts is exported with batch size 2. The final incomplete batch is\n    padded with its last clip; padded predictions are discarded.\n    """\n    real_batch = len(clips)\n    if real_batch == 0:\n        return\n\n    while len(clips) < S3_V4_BATCH:\n        clips.append(clips[-1].copy())\n        valid_lengths.append(0)\n\n    batch_np = np.stack(clips, axis=0)  # B T H W C\n    x = (\n        torch.from_numpy(batch_np)\n        .permute(0, 4, 1, 2, 3)\n        .float()\n        .div_(255.0)\n    )\n    x = (x - S3_V4_MEAN[None]) / S3_V4_STD[None]\n    x = x.to(\n        device=device,\n        dtype=torch.float32,\n        non_blocking=True,\n    )\n\n    # Same safety policy as Stage 1 A7: scripted video attention runs in FP32.\n    # Do not wrap this TorchScript call in autocast.\n    outputs = model(x)\n    if not isinstance(outputs, (tuple, list)) or len(outputs) != 4:\n        raise RuntimeError(\n            "Stage 3 model.ts must return "\n            "(speed, fused_accel, raw_accel, steering)"\n        )\n\n    speed_n, fused_n, raw_n, steering_n = [\n        tensor.float().cpu().numpy()\n        for tensor in outputs\n    ]\n\n    speed = _stage3_v4_denormalize(\n        speed_n,\n        stats,\n        "speed_mps",\n    )\n    fused = _stage3_v4_denormalize(\n        fused_n,\n        stats,\n        "accel_from_speed_mps2",\n    )\n    raw = _stage3_v4_denormalize(\n        raw_n,\n        stats,\n        "accel_from_speed_mps2",\n    )\n    steering = _stage3_v4_denormalize(\n        steering_n,\n        stats,\n        "steering_deg",\n    )\n\n    for i in range(real_batch):\n        n = int(valid_lengths[i])\n        if n <= 0:\n            continue\n        speed_parts.append(speed[i, :n].copy())\n        fused_accel_parts.append(fused[i, :n].copy())\n        raw_accel_parts.append(raw[i, :n].copy())\n        steering_parts.append(steering[i, :n].copy())\n\n\ndef _stage3_v4_predict_continuous(\n    path: Path,\n    model,\n    device,\n    stats: dict,\n):\n    """Sequential 10-Hz inference with bounded CPU memory."""\n    capture = cv2.VideoCapture(str(path))\n    if not capture.isOpened():\n        capture.release()\n        raise ValueError(\n            f"cannot open Stage 3 video: {path.name}"\n        )\n\n    speed_parts = []\n    fused_accel_parts = []\n    raw_accel_parts = []\n    steering_parts = []\n\n    clips = []\n    valid_lengths = []\n    current = []\n\n    try:\n        while True:\n            ok, bgr = capture.read()\n            if not ok:\n                break\n\n            current.append(_stage3_v4_resize_rgb(bgr))\n\n            if len(current) == S3_V4_NUM_FRAMES:\n                clips.append(np.stack(current, axis=0))\n                valid_lengths.append(S3_V4_NUM_FRAMES)\n                current = []\n\n                if len(clips) == S3_V4_BATCH:\n                    _stage3_v4_flush_batch(\n                        model,\n                        clips,\n                        valid_lengths,\n                        device,\n                        stats,\n                        speed_parts,\n                        fused_accel_parts,\n                        raw_accel_parts,\n                        steering_parts,\n                    )\n                    clips = []\n                    valid_lengths = []\n\n        if current:\n            valid = len(current)\n            while len(current) < S3_V4_NUM_FRAMES:\n                current.append(current[-1].copy())\n\n            clips.append(np.stack(current, axis=0))\n            valid_lengths.append(valid)\n\n        if clips:\n            _stage3_v4_flush_batch(\n                model,\n                clips,\n                valid_lengths,\n                device,\n                stats,\n                speed_parts,\n                fused_accel_parts,\n                raw_accel_parts,\n                steering_parts,\n            )\n    finally:\n        capture.release()\n\n    if not speed_parts:\n        raise ValueError(\n            f"cannot decode Stage 3 video: {path.name}"\n        )\n\n    return (\n        np.concatenate(speed_parts),\n        np.concatenate(fused_accel_parts),\n        np.concatenate(raw_accel_parts),\n        np.concatenate(steering_parts),\n    )\n\n\ndef _stage3_v4_apply_calibration(\n    speed_mps: np.ndarray,\n    fused_accel_mps2: np.ndarray,\n    raw_accel_mps2: np.ndarray,\n    steering_deg: np.ndarray,\n    calibration: dict,\n):\n    accel_cfg = dict(calibration["accel"])\n    steer_cfg = dict(calibration["steer"])\n\n    # Both selected calibration candidates use ordinal_blend=0. The ordinal\n    # branch was useful during training, but direct ordinal blending was not\n    # selected by any LOVO fold.\n    ordinal_blend = float(\n        accel_cfg.get("ordinal_blend", 0.0)\n    )\n    if abs(ordinal_blend) > 1e-12:\n        raise ValueError(\n            "Compact Stage 3 TorchScript supports "\n            "ordinal_blend=0 only; got "\n            f"{ordinal_blend}"\n        )\n\n    accel_window = int(\n        accel_cfg["smoothing_window"]\n    )\n\n    # Match calibration.py: speed and acceleration use the same centered\n    # smoothing window before the STOP gate / dynamic thresholds.\n    speed = _stage3_v4_centered_mean(\n        speed_mps,\n        accel_window,\n    )\n\n    source = str(accel_cfg["source"])\n    if source == "fused":\n        accel = fused_accel_mps2\n    elif source == "raw":\n        accel = raw_accel_mps2\n    else:\n        raise ValueError(\n            f"unknown Stage 3 accel source: {source}"\n        )\n\n    accel = _stage3_v4_centered_mean(\n        accel,\n        accel_window,\n    )\n    accel = (\n        accel\n        + float(accel_cfg["accel_bias_mps2"])\n    )\n\n    accel_labels = np.full(\n        len(speed),\n        "CONSTANT",\n        dtype=object,\n    )\n\n    stopped = (\n        speed\n        <= float(accel_cfg["stop_speed_mps"])\n    )\n    moving = ~stopped\n\n    accel_labels[stopped] = "STOPPED"\n\n    accel_labels[\n        moving\n        & (\n            accel\n            > float(\n                accel_cfg[\n                    "accel_deadzone_pos_mps2"\n                ]\n            )\n        )\n    ] = "ACCELERATING"\n\n    accel_labels[\n        moving\n        & (\n            accel\n            < -float(\n                accel_cfg[\n                    "accel_deadzone_neg_mps2"\n                ]\n            )\n        )\n    ] = "DECELERATING"\n\n    steering = _stage3_v4_centered_mean(\n        steering_deg,\n        int(steer_cfg["smoothing_window"]),\n    )\n    steering = (\n        int(steer_cfg["steering_sign"])\n        * steering\n        + float(steer_cfg["steering_bias_deg"])\n    )\n\n    steer_labels = np.full(\n        len(steering),\n        "STRAIGHT",\n        dtype=object,\n    )\n\n    steer_labels[\n        steering\n        < -float(\n            steer_cfg["left_deadzone_deg"]\n        )\n    ] = "LEFT"\n\n    steer_labels[\n        steering\n        > float(\n            steer_cfg["right_deadzone_deg"]\n        )\n    ] = "RIGHT"\n\n    return (\n        accel_labels.astype(str),\n        steer_labels.astype(str),\n    )\n\n\ndef predict_stage3(data_dir, model_dir):\n    import json\n\n    device = _device()\n    model_dir = Path(model_dir)\n\n    script_path = model_dir / "model.ts"\n    stats_path = model_dir / "target_stats.json"\n    calibration_path = model_dir / "calibration.json"\n\n    for required in (\n        script_path,\n        stats_path,\n        calibration_path,\n    ):\n        if not required.is_file():\n            raise FileNotFoundError(\n                f"Stage 3 asset not found: {required}"\n            )\n\n    stats = json.loads(\n        stats_path.read_text(encoding="utf-8")\n    )\n    calibration = json.loads(\n        calibration_path.read_text(\n            encoding="utf-8"\n        )\n    )\n\n    model = torch.jit.load(\n        str(script_path),\n        map_location=device,\n    )\n    model.eval()\n\n    videos = _video_paths(\n        Path(data_dir) / "videos"\n    )\n    rows = []\n\n    with torch.inference_mode():\n        for path in videos:\n            (\n                speed,\n                fused_accel,\n                raw_accel,\n                steering,\n            ) = _stage3_v4_predict_continuous(\n                path,\n                model,\n                device,\n                stats,\n            )\n\n            (\n                accel_labels,\n                steer_labels,\n            ) = _stage3_v4_apply_calibration(\n                speed,\n                fused_accel,\n                raw_accel,\n                steering,\n                calibration,\n            )\n\n            if len(accel_labels) != len(steer_labels):\n                raise RuntimeError(\n                    "Stage 3 output length mismatch "\n                    f"for {path.name}: "\n                    f"{len(accel_labels)} vs "\n                    f"{len(steer_labels)}"\n                )\n\n            for sample_index, (\n                accel_label,\n                steer_label,\n            ) in enumerate(\n                zip(\n                    accel_labels,\n                    steer_labels,\n                )\n            ):\n                rows.append(\n                    {\n                        "ID": path.stem,\n                        "sample_index": int(\n                            sample_index\n                        ),\n                        "accel_label": accel_label,\n                        "steer_label": steer_label,\n                    }\n                )\n\n    del model\n    torch.cuda.empty_cache()\n\n    return pd.DataFrame(\n        rows,\n        columns=[\n            "ID",\n            "sample_index",\n            "accel_label",\n            "steer_label",\n        ],\n    )\n'
+
 
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -257,27 +261,9 @@ if BASE_A7_ZIP is None:
 # ============================================================
 # Stage 3 sources
 # ============================================================
-TEMPLATE_DIR = (
-    REPO
-    / "submissions"
-    / "stage1a7_stage3"
-)
-INFERENCE_TEMPLATE = (
-    TEMPLATE_DIR / "inference.py"
-)
-REQUIREMENTS_TEMPLATE = (
-    TEMPLATE_DIR / "requirements.txt"
-)
-
-for p in (
-    INFERENCE_TEMPLATE,
-    REQUIREMENTS_TEMPLATE,
-):
-    if not p.is_file():
-        raise FileNotFoundError(
-            f"Missing supplied template: {p}"
-        )
-
+# No submission template files are read from the repository.
+# `submissions/` is gitignored in this project. The final inference.py is built
+# directly from the uploaded/Drive A7 inference.py + the embedded Stage 3 block.
 V4_RUN = (
     "vjepa21b_can_v4a_ordinal_fusion"
 )
@@ -386,23 +372,14 @@ BASE_INFERENCE = (
     encoding="utf-8"
 )
 
-NEW_INFERENCE = (
-    INFERENCE_TEMPLATE
-).read_text(
-    encoding="utf-8"
-)
-
 STAGE3_SPLIT = (
     "# ---------------------------------------------------------------------------\n"
     "# Stage 3:"
 )
 
-if (
-    STAGE3_SPLIT not in BASE_INFERENCE
-    or STAGE3_SPLIT not in NEW_INFERENCE
-):
+if STAGE3_SPLIT not in BASE_INFERENCE:
     raise RuntimeError(
-        "Could not locate Stage 3 boundary."
+        "Could not locate Stage 3 boundary in stage1_a7 inference.py."
     )
 
 BASE_PREFIX = BASE_INFERENCE.split(
@@ -410,16 +387,19 @@ BASE_PREFIX = BASE_INFERENCE.split(
     1,
 )[0]
 
-NEW_PREFIX = NEW_INFERENCE.split(
-    STAGE3_SPLIT,
-    1,
-)[0]
+# Final inference is always derived from the actual A7 file, so everything
+# before Stage 3 is byte-identical by construction.
+NEW_INFERENCE = BASE_PREFIX + STAGE3_V4_BLOCK
 
-if BASE_PREFIX != NEW_PREFIX:
+if (
+    NEW_INFERENCE.split(
+        STAGE3_SPLIT,
+        1,
+    )[0]
+    != BASE_PREFIX
+):
     raise RuntimeError(
-        "ABORT: supplied inference.py "
-        "changes Stage 1/2 code. "
-        "The A7 prefix must be byte-identical."
+        "ABORT: generated inference.py changed the A7 Stage 1/2 prefix."
     )
 
 STAGE1_ROOT = (
@@ -438,9 +418,24 @@ stage1_tree_before = {
     if p.is_file()
 }
 
+STAGE2_ROOT = A7_ROOT / "model" / "stage2"
+stage2_tree_before = {
+    p.relative_to(
+        STAGE2_ROOT
+    ).as_posix(): sha256(p)
+    for p in sorted(
+        STAGE2_ROOT.rglob("*")
+    )
+    if p.is_file()
+}
+
+a7_requirements_sha = sha256(
+    A7_ROOT / "requirements.txt"
+)
+
 print(
     "Stage 1/2 inference prefix: "
-    "EXACT MATCH"
+    "A7 SOURCE LOCKED"
 )
 print(
     "Stage 1 files locked:",
@@ -823,13 +818,21 @@ shutil.copy2(
     STAGE3_DIR / "target_stats.json",
 )
 
-shutil.copy2(
-    INFERENCE_TEMPLATE,
-    BUILD_ROOT / "inference.py",
+# Generate inference.py directly from the actual A7 submission.
+(BUILD_ROOT / "inference.py").write_text(
+    NEW_INFERENCE,
+    encoding="utf-8",
 )
 
+# Stage 3 is TorchScript-only at evaluation time and adds no runtime pip
+# dependency. Preserve the exact A7 requirements.txt instead of replacing it.
+A7_REQUIREMENTS = A7_ROOT / "requirements.txt"
+if not A7_REQUIREMENTS.is_file():
+    raise FileNotFoundError(
+        f"A7 requirements.txt not found: {A7_REQUIREMENTS}"
+    )
 shutil.copy2(
-    REQUIREMENTS_TEMPLATE,
+    A7_REQUIREMENTS,
     BUILD_ROOT / "requirements.txt",
 )
 
@@ -862,6 +865,25 @@ if (
         "changed during build"
     )
 
+stage2_tree_after = {
+    p.relative_to(
+        BUILD_ROOT / "model" / "stage2"
+    ).as_posix(): sha256(p)
+    for p in sorted(
+        (BUILD_ROOT / "model" / "stage2").rglob("*")
+    )
+    if p.is_file()
+}
+if stage2_tree_after != stage2_tree_before:
+    raise RuntimeError(
+        "ABORT: Stage 2 model files changed during build"
+    )
+
+if sha256(BUILD_ROOT / "requirements.txt") != a7_requirements_sha:
+    raise RuntimeError(
+        "ABORT: requirements.txt changed from the A7 submission"
+    )
+
 final_inference = (
     BUILD_ROOT
     / "inference.py"
@@ -890,6 +912,12 @@ print(
 )
 print(
     "Stage 1/2 inference unchanged: PASS"
+)
+print(
+    "Stage 2 model files unchanged: PASS"
+)
+print(
+    "A7 requirements.txt unchanged: PASS"
 )
 
 
@@ -1184,6 +1212,12 @@ report = {
                 "utf-8"
             )
         ).hexdigest()
+    ),
+    "stage2_files_sha256": (
+        stage2_tree_before
+    ),
+    "a7_requirements_sha256": (
+        a7_requirements_sha
     ),
     "vjepa_commit": (
         VJEPA_COMMIT
