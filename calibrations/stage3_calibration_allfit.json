@@ -1,0 +1,27 @@
+{
+  "ordinal_thresholds_mps2": [
+    0.1,
+    0.2,
+    0.3,
+    0.5
+  ],
+  "accel": {
+    "source": "raw",
+    "smoothing_window": 3,
+    "stop_speed_mps": 1.0,
+    "accel_deadzone_pos_mps2": 0.3,
+    "accel_deadzone_neg_mps2": 0.2,
+    "accel_bias_mps2": -0.05,
+    "ordinal_blend": 0.0,
+    "ordinal_scale_mps2": 0.25
+  },
+  "steer": {
+    "smoothing_window": 5,
+    "steering_sign": -1,
+    "steering_bias_deg": 1.5,
+    "left_deadzone_deg": 1.0,
+    "right_deadzone_deg": 2.0
+  },
+  "version": 1,
+  "selection": "all_labels_best"
+}
