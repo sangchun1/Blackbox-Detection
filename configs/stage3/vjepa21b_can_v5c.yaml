@@ -1,0 +1,65 @@
+seed: 20260918
+
+experiment:
+  name: vjepa21b_can_v5c_overlap_auxfusion
+  source_run: vjepa21b_can_v5b_last2_ft
+  source_checkpoint: best.pt
+  source_config: configs/stage3/vjepa21b_can_v5b.yaml
+
+data:
+  input_height: 288
+  input_width: 384
+  clip_len: 32
+  batch_size: 2
+
+validation:
+  # Complete segments are used so overlap-add is evaluated honestly.
+  num_segments: 25
+  per_bucket: 5
+  strides: [32, 16, 8]
+  center_floors: [1.0, 0.25]
+  use_amp: false
+
+  # Select the best overlap method on tune segments. If methods are within
+  # this score range, prefer the cheaper (larger-stride) method.
+  overlap_tie_tolerance: 0.002
+
+  # Reject an overlap method that materially hurts the untouched segment
+  # holdout relative to non-overlap.
+  overlap_holdout_max_drop: 0.002
+
+  proxy_rules:
+    sensitive:
+      stop_speed_mps: 0.30
+      accel_deadzone_mps2: 0.10
+      steer_deadzone_deg: 2.0
+    medium:
+      stop_speed_mps: 0.50
+      accel_deadzone_mps2: 0.20
+      steer_deadzone_deg: 5.0
+    conservative:
+      stop_speed_mps: 1.00
+      accel_deadzone_mps2: 0.30
+      steer_deadzone_deg: 8.0
+
+fusion_search:
+  stop_weights: [0.0, 0.25, 0.50, 0.75]
+  accel_weights: [0.0, 0.15, 0.30, 0.50]
+  steer_weights: [0.0, 0.15, 0.30, 0.50]
+  turn_weights: [0.0, 0.15, 0.30]
+
+  stop_temperature_mps: 0.25
+  accel_temperature_mps2: 0.10
+  steer_temperature_deg: 2.0
+
+  # Fusion is selected on tune only. It is accepted for production only if
+  # it also improves the untouched holdout and the full diverse subset.
+  min_holdout_delta: 0.0
+  min_full_delta: 0.001
+  max_single_rule_holdout_drop: 0.01
+
+public_sanity:
+  # Uses the 50 released labels only as an after-the-fact sanity check.
+  # These labels do NOT choose fusion weights.
+  enabled: true
+  calibration: calibrations/stage3_calibration_consensus.json
