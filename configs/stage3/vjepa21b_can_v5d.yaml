@@ -1,0 +1,219 @@
+seed: 20260918
+
+experiment:
+  name: vjepa21b_can_v5d_accel_decision
+
+data:
+  clip_len: 32
+  train_window_stride: 16
+  val_window_stride: 16
+  input_height: 288
+  input_width: 384
+  num_workers: 2
+  train_random_flip: true
+
+  sampler:
+    inverse_frequency_power: 0.35
+    max_normalized_weight: 30.0
+    event_multipliers:
+      cruise: 0.55
+      turn: 1.50
+      moderate_accel: 2.75
+      moderate_decel: 3.25
+      moderate_mixed: 3.75
+      hard_accel: 4.25
+      hard_decel: 4.75
+      hard_mixed: 5.00
+      stop_start: 4.00
+      reversal: 2.00
+    source_multipliers:
+      comma2k19: 1.0
+      a2d2: 20.0
+
+  sources:
+    comma2k19:
+      steering_direction_deadzone_deg: 2.0
+      steering_activity_scale_deg: 8.0
+      steering_sign_multiplier: 1.0
+    a2d2:
+      steering_direction_deadzone_deg: 10.0
+      steering_activity_scale_deg: 60.0
+      steering_sign_multiplier: 1.0
+
+model:
+  backbone: vjepa2_1_vit_base_384
+  out_layers: [2, 5, 8, 11]
+  temporal_hidden: 256
+  temporal_layers: 2
+  feature_dim: 384
+
+  spatial_pool:
+    grid: [3, 4]
+    gate_init: 0.10
+
+  accel_ordinal_thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+  accel_fusion:
+    enabled: true
+    hidden: 64
+    gate_init: 0.10
+    detach_ordinal_inputs: true
+
+  accel_state:
+    thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+    hidden: 96
+    dropout: 0.10
+
+  stop_thresholds_mps: [0.10, 0.30, 0.50, 1.00, 2.00]
+  turn_yaw_thresholds_rps: [0.01, 0.03, 0.05]
+  steer_activity_thresholds: [0.25, 0.50, 1.00, 2.00]
+  brake_thresholds_bar: [0.50, 2.00, 5.00]
+  throttle_thresholds_pct: [1.00, 5.00, 10.00]
+
+  backbone_finetune:
+    last_n_blocks: 2
+    train_final_tap_norm: true
+
+training:
+  epochs: 2
+  batch_size: 1
+  grad_accum_steps: 8
+
+  # Already-trained V5-B heads move conservatively.
+  head_learning_rate: 0.000010
+
+  # Fresh acceleration-state head learns faster.
+  accel_state_head_learning_rate: 0.000050
+
+  penultimate_block_learning_rate: 0.000001
+  last_block_learning_rate: 0.000002
+
+  head_weight_decay: 0.01
+  accel_state_head_weight_decay: 0.01
+  backbone_weight_decay: 0.05
+
+  warmup_ratio: 0.10
+  min_learning_rate_ratio: 0.10
+  grad_clip_norm: 1.0
+  amp_dtype: bf16
+
+  max_steps_per_epoch: 2000
+  max_val_steps: 800
+  early_stopping_patience: 0
+  log_interval: 20
+
+warm_start:
+  run_name: vjepa21b_can_v5b_last2_ft
+  checkpoint: best.pt
+  strict_existing: true
+
+loss:
+  base:
+    mode: accel_v4_fusion
+    weights:
+      speed_mps: 1.0
+      accel_from_speed_mps2: 1.5
+      steering_deg: 1.5
+      yaw_rate_rps: 0.75
+    normalization: {}
+
+    accel_v2:
+      magnitude_weighted_regression:
+        scale_mps2: 0.30
+        gain: 2.0
+        max_weight: 3.0
+        beta: 0.5
+      multi_threshold_margin:
+        weight: 0.90
+        thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+        temperature_mps2: 0.05
+      speed_delta:
+        weight: 0.60
+        beta_normalized: 0.01
+      speed_accel_consistency:
+        weight: 0.15
+        speed_delta_scale_normalized: 0.01
+        accel_scale_normalized: 0.50
+        beta: 0.50
+
+    accel_v3:
+      ordinal:
+        weight: 0.75
+        thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+        monotonic_weight: 0.10
+
+    accel_v4:
+      fusion:
+        diagnostics_only: true
+
+  stop_ordinal:
+    weight: 0.50
+    thresholds_mps: [0.10, 0.30, 0.50, 1.00, 2.00]
+    monotonic_weight: 0.10
+
+  delta_speed:
+    weight: 0.75
+    beta_mps: 0.05
+    dt_s: 0.10
+    accel_consistency_weight: 0.20
+    consistency_beta_mps2: 0.20
+
+  # New V5-D objectives.
+  accel_state:
+    weight: 0.75
+    thresholds_mps2: [0.10, 0.20, 0.30, 0.50]
+    label_smoothing: 0.02
+    monotonic_weight: 0.05
+
+  accel_temporal_gradient:
+    weight: 0.15
+    horizons: [1, 2, 4]
+    beta_normalized: 0.10
+
+  integrated_kinematics:
+    weight: 0.30
+    horizons: [1, 2, 4]
+    dt_s: 0.10
+    beta_mps: 0.05
+
+  turn_ordinal:
+    weight: 0.25
+    thresholds_rps: [0.01, 0.03, 0.05]
+    monotonic_weight: 0.10
+
+  steer_direction:
+    weight: 0.20
+
+  steer_activity_ordinal:
+    weight: 0.10
+    thresholds: [0.25, 0.50, 1.00, 2.00]
+    monotonic_weight: 0.10
+
+  brake_ordinal:
+    weight: 0.10
+    thresholds_bar: [0.50, 2.00, 5.00]
+    monotonic_weight: 0.10
+
+  throttle_ordinal:
+    weight: 0.05
+    thresholds_pct: [1.00, 5.00, 10.00]
+    monotonic_weight: 0.10
+
+validation:
+  proxy_rules:
+    sensitive:
+      stop_speed_mps: 0.30
+      accel_deadzone_mps2: 0.10
+      steer_deadzone_deg: 2.0
+    medium:
+      stop_speed_mps: 0.50
+      accel_deadzone_mps2: 0.20
+      steer_deadzone_deg: 5.0
+    conservative:
+      stop_speed_mps: 1.00
+      accel_deadzone_mps2: 0.30
+      steer_deadzone_deg: 8.0
+
+logging:
+  wandb_enabled: true
+  wandb_project: blackbox-stage3
+  wandb_group: vjepa21b_can_v5d
