@@ -82,6 +82,28 @@ class VideoMambaDenseTokenAdapter(nn.Module):
             ).transpose(1, 2).to(dtype=self.backbone.temporal_pos_embedding.dtype)
         return pos.to(device=device, dtype=dtype)
 
+    def configure_frozen_backbone(self) -> VideoMambaFinetuneReport:
+        """Freeze the entire VideoMamba backbone for interface adaptation."""
+        self.backbone.requires_grad_(False)
+        self._ft_layer_indices = ()
+        self._train_final_norm = False
+        self._checkpoint_trainable = False
+        self._partial_ft_configured = True
+        self.train(self.training)
+
+        frozen = sum(
+            p.numel()
+            for p in self.backbone.parameters()
+            if not p.requires_grad
+        )
+        return VideoMambaFinetuneReport(
+            depth=len(self.backbone.layers),
+            trainable_layer_indices=(),
+            train_final_norm=False,
+            trainable_backbone_params=0,
+            frozen_backbone_params=int(frozen),
+        )
+
     def configure_partial_backbone(
         self,
         *,
@@ -200,7 +222,7 @@ class VideoMambaDenseTokenAdapter(nn.Module):
 
 
 class VideoMambaDenseCANV6A(nn.Module):
-    """VideoMamba-S backbone with the V5-D Stage3 decision stack."""
+    """VideoMamba backbone with the V5-D Stage3 decision stack."""
 
     def __init__(
         self,
@@ -272,6 +294,9 @@ class VideoMambaDenseCANV6A(nn.Module):
         assert isinstance(final, nn.Linear)
         nn.init.normal_(final.weight, mean=0.0, std=0.01)
         nn.init.zeros_(final.bias)
+
+    def configure_frozen_backbone(self):
+        return self.backbone.configure_frozen_backbone()
 
     def configure_partial_backbone(
         self,
@@ -378,7 +403,11 @@ def load_v5d_compatible_warm_start(
     }
 
 
-def split_v6a_optimizer_parameters(model: VideoMambaDenseCANV6A):
+def split_v6a_optimizer_parameters(
+    model: VideoMambaDenseCANV6A,
+    *,
+    require_backbone: bool = True,
+):
     groups = {
         "interface": [],
         "head": [],
@@ -412,9 +441,29 @@ def split_v6a_optimizer_parameters(model: VideoMambaDenseCANV6A):
         else:
             raise RuntimeError(f"unclassified trainable V6-A parameter: {name}")
 
-    for key, items in groups.items():
-        if not items:
+    always_required = ("interface", "head", "accel_state_head")
+    for key in always_required:
+        if not groups[key]:
             raise RuntimeError(f"V6-A optimizer family is empty: {key}")
+
+    backbone_keys = (
+        "backbone_penultimate",
+        "backbone_last",
+        "backbone_final_norm",
+    )
+    if require_backbone:
+        for key in backbone_keys:
+            if not groups[key]:
+                raise RuntimeError(
+                    f"V6-A optimizer family is empty: {key}"
+                )
+    else:
+        for key in backbone_keys:
+            if groups[key]:
+                raise RuntimeError(
+                    "Stage-A frozen backbone unexpectedly has trainable "
+                    f"parameters in {key}"
+                )
     return groups
 
 

@@ -105,9 +105,9 @@ model:
     train_final_norm: true
     checkpoint_trainable: true
 training:
-  epochs: 2
-  batch_size: 1
-  grad_accum_steps: 8
+  epochs: 6
+  batch_size: 2
+  grad_accum_steps: 4
   interface_learning_rate: 5.0e-05
   head_learning_rate: 1.0e-05
   accel_state_head_learning_rate: 5.0e-05
@@ -122,10 +122,26 @@ training:
   min_learning_rate_ratio: 0.1
   grad_clip_norm: 1.0
   amp_dtype: bf16
-  max_steps_per_epoch: 2000
+  max_steps_per_epoch: 4000
   max_val_steps: 800
   early_stopping_patience: 0
   log_interval: 20
+  two_stage:
+    enabled: true
+    stage_a:
+      name: interface_adaptation
+      epochs: 1
+      max_steps_per_epoch: 4000
+      early_stopping_patience: 0
+      freeze_backbone: true
+    stage_b:
+      name: last2_finetune
+      epochs: 5
+      max_steps_per_epoch: 4000
+      early_stopping_patience: 0
+      last_n_layers: 2
+      train_final_norm: true
+      checkpoint_trainable: true
 warm_start:
   run_name: vjepa21b_can_v5d_accel_decision
   checkpoint: best_accel_proxy.pt
