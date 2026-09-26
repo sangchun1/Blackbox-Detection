@@ -10,6 +10,7 @@ data:
   input_height: 288
   input_width: 384
   num_workers: 2
+  val_num_workers: 0
   train_random_flip: true
 
   sampler:

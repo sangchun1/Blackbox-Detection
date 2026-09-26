@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
+import cv2
 import numpy as np
 
 from .v5_dataset import MixedStage3CANDataset
@@ -13,6 +17,71 @@ class MixedStage3CANV5DDataset(MixedStage3CANDataset):
     priority and adds moderate + mixed acceleration categories so the sampler
     does not focus only on >0.5 m/s^2 extremes.
     """
+
+
+    def _read_clip(
+        self,
+        path: Path,
+        start: int,
+        *,
+        sequential: bool,
+    ) -> list[np.ndarray]:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            cap.release()
+            return []
+
+        frames: list[np.ndarray] = []
+        try:
+            if sequential:
+                for _ in range(int(start)):
+                    ok, _ = cap.read()
+                    if not ok:
+                        return []
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(start))
+
+            for _ in range(self.clip_len):
+                ok, bgr = cap.read()
+                if not ok:
+                    break
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                rgb = cv2.resize(
+                    rgb,
+                    (self.input_w, self.input_h),
+                    interpolation=cv2.INTER_AREA,
+                )
+                frames.append(rgb)
+        finally:
+            cap.release()
+
+        return frames
+
+    def _decode(self, path: Path, start: int) -> np.ndarray:
+        """Drive-safe MP4 decoding for V5-D."""
+        path = Path(path)
+        last_count = 0
+
+        for attempt in range(3):
+            frames = self._read_clip(path, start, sequential=False)
+            last_count = len(frames)
+            if last_count == self.clip_len:
+                return np.stack(frames, axis=0)
+            time.sleep(0.20 * (attempt + 1))
+
+        for attempt in range(2):
+            frames = self._read_clip(path, start, sequential=True)
+            last_count = len(frames)
+            if last_count == self.clip_len:
+                return np.stack(frames, axis=0)
+            time.sleep(0.40 * (attempt + 1))
+
+        size = path.stat().st_size if path.is_file() else -1
+        raise RuntimeError(
+            "V5-D robust decode failed after retries: "
+            f"path={path} start={start} clip_len={self.clip_len} "
+            f"last_decoded={last_count} size_bytes={size}"
+        )
 
     def event_tag(self, index: int) -> str:
         seg_idx, start = self.windows[index]
