@@ -287,6 +287,6 @@ inference_lock:
   turn_weight: 0.3
   state_weight: 0.0
 logging:
-  wandb_enabled: true
+  wandb_enabled: false
   wandb_project: blackbox-stage3
   wandb_group: videomamba_m_mask_can_v6a
