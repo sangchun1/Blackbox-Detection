@@ -153,11 +153,13 @@ class VideoMambaDenseTokenAdapter(nn.Module):
 
     def _run_layers(self, hidden_states, residual):
         layers = self.backbone.layers
-        first_trainable = (
-            min(self._ft_layer_indices)
-            if self._partial_ft_configured
-            else len(layers)
-        )
+
+        # Stage A: fully frozen backbone -> all layers run under no_grad.
+        # Stage B: only the configured tail layers are trainable.
+        if self._partial_ft_configured and self._ft_layer_indices:
+            first_trainable = min(self._ft_layer_indices)
+        else:
+            first_trainable = len(layers)
 
         if first_trainable > 0:
             with torch.no_grad():
