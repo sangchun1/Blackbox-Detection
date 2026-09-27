@@ -7,6 +7,7 @@ from typing import Sequence
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint as torch_checkpoint
 from torch import nn
 
 from .v5_models import DenseTemporalCANHeadV5, SpatialMomentPooler
@@ -172,14 +173,36 @@ class VideoMambaDenseTokenAdapter(nn.Module):
                 residual = residual.detach()
 
         for idx in range(first_trainable, len(layers)):
-            hidden_states, residual = layers[idx](
-                hidden_states,
-                residual,
-                inference_params=None,
-                use_checkpoint=(
-                    self.training and self._checkpoint_trainable
-                ),
-            )
+            layer = layers[idx]
+
+            if self.training and self._checkpoint_trainable:
+                # Frozen prefix output is detached. The first trainable block can
+                # therefore receive requires_grad=False inputs.
+                #
+                # Reentrant checkpointing can then lose parameter gradients, so use
+                # the non-reentrant implementation explicitly.
+                def _forward_block(h, r, _layer=layer):
+                    return _layer(
+                        h,
+                        r,
+                        inference_params=None,
+                        use_checkpoint=False,
+                    )
+
+                hidden_states, residual = torch_checkpoint.checkpoint(
+                    _forward_block,
+                    hidden_states,
+                    residual,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, residual = layer(
+                    hidden_states,
+                    residual,
+                    inference_params=None,
+                    use_checkpoint=False,
+                )
+
         return hidden_states, residual
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
